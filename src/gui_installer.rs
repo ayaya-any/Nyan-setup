@@ -3,13 +3,15 @@ use crate::d2d::{
     ThemeMode, VectorIcon,
 };
 use crate::package::{
-    extract_package_files, format_bytes, InstallProgressEvent, PackageManifest, UninstallReceipt,
+    extract_package_files, format_bytes, InstallProgressEvent, PackageManifest,
+    ProcessConflictPolicy, UninstallReceipt,
 };
 use crate::win32_ops::{
     create_shell_shortcut, detect_existing_installation, execute_uninstall_steps,
     expand_install_path, find_running_target_processes, get_clipboard_text, get_known_folder_path,
     pick_folder_dialog, query_disk_space, register_uninstall_entry, schedule_self_delete,
-    set_clipboard_text, shell_open, to_wide, write_uninstaller_files, ExistingInstallInfo,
+    set_clipboard_text, shell_open, terminate_running_target_processes, to_wide,
+    write_uninstaller_files, ExistingInstallInfo,
 };
 use std::env;
 use std::path::{Path, PathBuf};
@@ -25,8 +27,8 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTS
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE,
-    VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_END,
+    VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
@@ -94,6 +96,7 @@ pub struct InstallerWindowState {
     // Existing installation & running processes detection (Update Mode)
     pub existing_install: Option<ExistingInstallInfo>,
     pub running_processes: Vec<(u32, String)>,
+    pub show_process_conflict_modal: bool,
 
     // Disk space info (free_bytes, total_bytes)
     pub disk_space: Option<(u64, u64)>,
@@ -104,9 +107,29 @@ pub struct InstallerWindowState {
     pub target_progress: f32,
     pub status_text: String,
     pub logs: Vec<String>,
+    pub log_scroll_x: f32,
+    pub log_scroll_y: f32,
+    pub log_auto_scroll: bool,
+    pub dragging_log_hscroll: Option<f32>,
+    pub dragging_log_vscroll: Option<f32>,
     pub install_error: Option<String>,
     pub rx: Option<Receiver<InstallProgressEvent>>,
     pub uninstall_done: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LogScrollMetrics {
+    viewport: RectF,
+    row_h: f32,
+    content_w: f32,
+    max_scroll_x: f32,
+    max_scroll_y: f32,
+    scroll_x: f32,
+    scroll_y: f32,
+    h_track: Option<RectF>,
+    h_thumb: Option<RectF>,
+    v_track: Option<RectF>,
+    v_thumb: Option<RectF>,
 }
 
 impl InstallerWindowState {
@@ -128,16 +151,17 @@ impl InstallerWindowState {
         let install_dir_str = initial_dir.to_string_lossy().to_string();
         let disk_space = query_disk_space(&initial_dir);
 
-        let mut exe_names: Vec<String> = manifest
+        let mut candidate_files: Vec<String> = manifest
             .files
             .iter()
-            .filter(|f| f.relative_path.to_ascii_lowercase().ends_with(".exe"))
             .map(|f| f.relative_path.clone())
             .collect();
-        if !manifest.config.main_exe.is_empty() && !exe_names.contains(&manifest.config.main_exe) {
-            exe_names.push(manifest.config.main_exe.clone());
+        if !manifest.config.main_exe.is_empty()
+            && !candidate_files.contains(&manifest.config.main_exe)
+        {
+            candidate_files.push(manifest.config.main_exe.clone());
         }
-        let running_processes = find_running_target_processes(&initial_dir, &exe_names);
+        let running_processes = find_running_target_processes(&initial_dir, &candidate_files);
 
         let opt_desk = manifest.config.create_desktop_shortcut;
         let opt_menu = manifest.config.create_start_menu_shortcut;
@@ -172,12 +196,18 @@ impl InstallerWindowState {
             opt_kill_running_process: opt_kill,
             existing_install,
             running_processes,
+            show_process_conflict_modal: false,
             disk_space,
             is_working: false,
             progress: 0.0,
             target_progress: 0.0,
             status_text: "准备就绪".to_string(),
             logs: Vec::new(),
+            log_scroll_x: 0.0,
+            log_scroll_y: 0.0,
+            log_auto_scroll: true,
+            dragging_log_hscroll: None,
+            dragging_log_vscroll: None,
             install_error: None,
             rx: None,
             uninstall_done: false,
@@ -216,12 +246,18 @@ impl InstallerWindowState {
             opt_kill_running_process: true,
             existing_install: None,
             running_processes: Vec::new(),
+            show_process_conflict_modal: false,
             disk_space: None,
             is_working: false,
             progress: 0.0,
             target_progress: 0.0,
             status_text: "准备卸载应用程序".to_string(),
             logs: Vec::new(),
+            log_scroll_x: 0.0,
+            log_scroll_y: 0.0,
+            log_auto_scroll: true,
+            dragging_log_hscroll: None,
+            dragging_log_vscroll: None,
             install_error: None,
             rx: None,
             uninstall_done: false,
@@ -233,18 +269,17 @@ impl InstallerWindowState {
         self.disk_space = query_disk_space(&p);
         if let WizardMode::Installer { ref manifest, .. } = self.mode {
             self.existing_install = detect_existing_installation(&manifest.config.app_id, &p);
-            let mut exe_names: Vec<String> = manifest
+            let mut candidate_files: Vec<String> = manifest
                 .files
                 .iter()
-                .filter(|f| f.relative_path.to_ascii_lowercase().ends_with(".exe"))
                 .map(|f| f.relative_path.clone())
                 .collect();
             if !manifest.config.main_exe.is_empty()
-                && !exe_names.contains(&manifest.config.main_exe)
+                && !candidate_files.contains(&manifest.config.main_exe)
             {
-                exe_names.push(manifest.config.main_exe.clone());
+                candidate_files.push(manifest.config.main_exe.clone());
             }
-            self.running_processes = find_running_target_processes(&p, &exe_names);
+            self.running_processes = find_running_target_processes(&p, &candidate_files);
         }
     }
 
@@ -281,6 +316,39 @@ impl InstallerWindowState {
         }
     }
 
+    pub fn try_begin_installation(&mut self) {
+        self.refresh_disk_space();
+        let policy = match &self.mode {
+            WizardMode::Installer { manifest, .. } => manifest.config.process_conflict_policy,
+            _ => return,
+        };
+        if policy == ProcessConflictPolicy::PromptUser && !self.running_processes.is_empty() {
+            self.show_process_conflict_modal = true;
+            self.invalidate();
+            return;
+        }
+        self.opt_kill_running_process = true;
+        self.start_installation();
+    }
+
+    pub fn terminate_occupying_processes(&mut self) {
+        let target_dir = PathBuf::from(self.install_dir_input.trim());
+        if let WizardMode::Installer { ref manifest, .. } = self.mode {
+            let mut candidate_files: Vec<String> = manifest
+                .files
+                .iter()
+                .map(|f| f.relative_path.clone())
+                .collect();
+            if !manifest.config.main_exe.is_empty()
+                && !candidate_files.contains(&manifest.config.main_exe)
+            {
+                candidate_files.push(manifest.config.main_exe.clone());
+            }
+            let _ = terminate_running_target_processes(&target_dir, &candidate_files);
+        }
+        self.refresh_disk_space();
+    }
+
     pub fn start_installation(&mut self) {
         if self.is_working {
             return;
@@ -309,6 +377,11 @@ impl InstallerWindowState {
         self.target_progress = 0.05;
         self.install_error = None;
         self.logs.clear();
+        self.log_scroll_x = 0.0;
+        self.log_scroll_y = 0.0;
+        self.log_auto_scroll = true;
+        self.dragging_log_hscroll = None;
+        self.dragging_log_vscroll = None;
         if let Some(ref ex) = self.existing_install {
             self.logs.push(format!(
                 "[覆盖更新] 检测到已安装 v{} → 升级/更新至 v{}",
@@ -565,6 +638,10 @@ impl InstallerWindowState {
                     WizardStep::Installing => self.draw_step_installing(card),
                     WizardStep::Completed => self.draw_step_completed(card, &manifest_clone),
                 }
+
+                if self.show_process_conflict_modal {
+                    self.draw_process_conflict_modal();
+                }
             }
             WizardMode::Uninstaller { receipt, .. } => {
                 let title = format!("{} 卸载向导", receipt.app_name);
@@ -750,14 +827,13 @@ impl InstallerWindowState {
             1,
             false,
         );
-        self.renderer.draw_text(
+        self.renderer.draw_text_ellipsis(
             &hero_sub,
             &self.renderer.font_body,
             RectF::new(hero.x + 82.0, hero.y + 40.0, hero.w - 96.0, 22.0),
             pal.on_primary_container,
             0,
             1,
-            false,
         );
 
         // License Agreement Scrollable Box (y = card.y + 118.0, h = 192.0)
@@ -771,7 +847,7 @@ impl InstallerWindowState {
             false,
         );
 
-        let eula_box = RectF::new(x0, card.y + 118.0, w_full, 192.0);
+        let eula_box = RectF::new(x0, card.y + 118.0, w_full, 232.0);
         self.renderer
             .fill_rounded_rect(eula_box, 10.0, pal.surface_variant);
         self.renderer
@@ -782,7 +858,7 @@ impl InstallerWindowState {
         let visible = lines
             .into_iter()
             .skip(start)
-            .take(10)
+            .take(12)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -804,28 +880,6 @@ impl InstallerWindowState {
         unsafe {
             self.renderer.rt().PopAxisAlignedClip();
         }
-
-        // Process termination option bar right below EULA box (y = card.y + 318.0, h = 36.0)
-        let chk_kill_welcome = RectF::new(x0, card.y + 318.0, w_full, 36.0);
-        let kill_label = if !self.running_processes.is_empty() {
-            format!(
-                "更新/安装前自动结束正在运行的进程 (检测到 {} 正在运行，PID: {})",
-                self.running_processes[0].1, self.running_processes[0].0
-            )
-        } else {
-            format!(
-                "更新/安装前自动结束正在运行的目标程序进程 ({})",
-                manifest.config.main_exe
-            )
-        };
-        self.renderer.draw_checkbox(
-            chk_kill_welcome,
-            self.opt_kill_running_process,
-            chk_kill_welcome.contains(mx, my),
-            &kill_label,
-            None,
-            &pal,
-        );
 
         // Footer separator & controls
         let footer_line_y = card.y + card.h - 62.0;
@@ -997,8 +1051,8 @@ impl InstallerWindowState {
             );
         }
 
-        // 4 Checkboxes for Shortcuts, Uninstaller, and Process Termination (y = card.y + 184..336)
-        let c1 = RectF::new(x0, card.y + 184.0, w_full, 36.0);
+        // 3 Checkboxes for Shortcuts and Uninstaller (y = card.y + 190..316)
+        let c1 = RectF::new(x0, card.y + 190.0, w_full, 40.0);
         self.renderer.draw_checkbox(
             c1,
             self.opt_desktop_shortcut,
@@ -1008,7 +1062,7 @@ impl InstallerWindowState {
             &pal,
         );
 
-        let c2 = RectF::new(x0, card.y + 222.0, w_full, 36.0);
+        let c2 = RectF::new(x0, card.y + 234.0, w_full, 40.0);
         self.renderer.draw_checkbox(
             c2,
             self.opt_start_menu_shortcut,
@@ -1018,34 +1072,12 @@ impl InstallerWindowState {
             &pal,
         );
 
-        let c3 = RectF::new(x0, card.y + 260.0, w_full, 36.0);
+        let c3 = RectF::new(x0, card.y + 278.0, w_full, 40.0);
         self.renderer.draw_checkbox(
             c3,
             self.opt_register_uninstaller,
             c3.contains(mx, my),
             "生成卸载程序并注册到 Windows“应用和功能”列表",
-            None,
-            &pal,
-        );
-
-        let c4 = RectF::new(x0, card.y + 298.0, w_full, 36.0);
-        let kill_title = if !self.running_processes.is_empty() {
-            format!(
-                "安装/更新前自动结束正在运行的进程 (当前检测到 {} 正在运行，共 {} 个实例)",
-                self.running_processes[0].1,
-                self.running_processes.len()
-            )
-        } else {
-            format!(
-                "安装/更新前自动结束正在运行的目标程序进程 ({})",
-                manifest.config.main_exe
-            )
-        };
-        self.renderer.draw_checkbox(
-            c4,
-            self.opt_kill_running_process,
-            c4.contains(mx, my),
-            &kill_title,
             None,
             &pal,
         );
@@ -1092,6 +1124,399 @@ impl InstallerWindowState {
         );
     }
 
+    fn process_conflict_modal_rect(&self) -> RectF {
+        let mw = 516.0;
+        let mh = 336.0;
+        RectF::new(
+            (self.width_dip - mw) * 0.5,
+            (self.height_dip - mh) * 0.5 + 14.0,
+            mw,
+            mh,
+        )
+    }
+
+    fn draw_process_conflict_modal(&self) {
+        let pal = self.palette;
+        let mx = self.mouse_x;
+        let my = self.mouse_y;
+        let w = self.width_dip;
+        let h = self.height_dip;
+
+        // 1. Dimmed backdrop over content area (leave top titlebar accessible)
+        self.renderer
+            .fill_rect(RectF::new(0.0, 46.0, w, h - 46.0), rgba(0x000000, 0.48));
+
+        // 2. Modal dialog card with drop shadow
+        let modal = self.process_conflict_modal_rect();
+        for i in (1..=4).rev() {
+            let sp = i as f32 * 3.0;
+            let sr = RectF::new(
+                modal.x - sp * 0.5,
+                modal.y + sp * 0.8,
+                modal.w + sp,
+                modal.h + sp,
+            );
+            self.renderer
+                .fill_rounded_rect(sr, 16.0, rgba(0x000000, 0.12 / (i as f32)));
+        }
+        self.renderer
+            .fill_rounded_rect(modal, 14.0, pal.surface_elevated);
+        self.renderer
+            .draw_rounded_rect(modal, 14.0, 1.5, pal.warning);
+
+        // 3. Header with warning icon & close button
+        let icon_cx = modal.x + 34.0;
+        let icon_cy = modal.y + 34.0;
+        self.renderer
+            .fill_circle(icon_cx, icon_cy, 16.0, rgba(0xF59E0B, 0.16));
+        self.renderer
+            .draw_icon(VectorIcon::Info, icon_cx, icon_cy, 18.0, pal.warning);
+
+        self.renderer.draw_text(
+            "检测到目标程序正在运行 (文件被占用)",
+            &self.renderer.font_title_md,
+            RectF::new(modal.x + 60.0, modal.y + 16.0, modal.w - 108.0, 22.0),
+            pal.text_primary,
+            0,
+            1,
+            false,
+        );
+        self.renderer.draw_text(
+            "以下进程正在占用目标安装目录，请先手动关闭它们后点击“重试”，或选择“结束进程并重试”：",
+            &self.renderer.font_caption,
+            RectF::new(modal.x + 60.0, modal.y + 40.0, modal.w - 76.0, 20.0),
+            pal.text_secondary,
+            0,
+            1,
+            false,
+        );
+
+        let btn_close_x = RectF::new(modal.x + modal.w - 42.0, modal.y + 14.0, 28.0, 28.0);
+        if btn_close_x.contains(mx, my) {
+            self.renderer
+                .fill_rounded_rect(btn_close_x, 6.0, rgba(0xEF4444, 0.16));
+        }
+        self.renderer.draw_icon(
+            VectorIcon::Close,
+            btn_close_x.x + 14.0,
+            btn_close_x.y + 14.0,
+            14.0,
+            pal.text_secondary,
+        );
+
+        // 4. Occupying Processes Table Box
+        let list_box = RectF::new(modal.x + 22.0, modal.y + 72.0, modal.w - 44.0, 186.0);
+        self.renderer
+            .fill_rounded_rect(list_box, 10.0, pal.surface_variant);
+        self.renderer
+            .draw_rounded_rect(list_box, 10.0, 1.0, pal.outline_subtle);
+
+        let header_bar = RectF::new(list_box.x, list_box.y, list_box.w, 28.0);
+        self.renderer
+            .fill_rounded_rect(header_bar, 10.0, rgba(0xF59E0B, 0.10));
+        self.renderer.draw_text(
+            &format!("正在运行的占用进程 (共 {} 个实例)", self.running_processes.len()),
+            &self.renderer.font_caption,
+            RectF::new(list_box.x + 14.0, list_box.y + 4.0, list_box.w - 130.0, 20.0),
+            pal.text_primary,
+            0,
+            1,
+            false,
+        );
+        self.renderer.draw_text(
+            "进程 PID",
+            &self.renderer.font_caption,
+            RectF::new(list_box.x + list_box.w - 104.0, list_box.y + 4.0, 90.0, 20.0),
+            pal.text_secondary,
+            2,
+            1,
+            false,
+        );
+
+        let max_rows = 5usize;
+        for (idx, (pid, exe_name)) in self.running_processes.iter().take(max_rows).enumerate() {
+            let ry = list_box.y + 34.0 + (idx as f32) * 28.0;
+            if idx % 2 == 1 {
+                self.renderer.fill_rounded_rect(
+                    RectF::new(list_box.x + 6.0, ry, list_box.w - 12.0, 25.0),
+                    4.0,
+                    rgba(0x6366F1, 0.04),
+                );
+            }
+            self.renderer
+                .fill_circle(list_box.x + 18.0, ry + 12.5, 3.5, pal.warning);
+            self.renderer.draw_text(
+                exe_name,
+                &self.renderer.font_mono,
+                RectF::new(list_box.x + 30.0, ry, list_box.w - 140.0, 25.0),
+                pal.text_primary,
+                0,
+                1,
+                false,
+            );
+            self.renderer.draw_text(
+                &format!("PID: {}", pid),
+                &self.renderer.font_mono,
+                RectF::new(list_box.x + list_box.w - 104.0, ry, 90.0, 25.0),
+                pal.text_secondary,
+                2,
+                1,
+                false,
+            );
+        }
+        if self.running_processes.len() > max_rows {
+            let extra = self.running_processes.len() - max_rows;
+            self.renderer.draw_text(
+                &format!("... 以及另外 {} 个同名运行实例", extra),
+                &self.renderer.font_caption,
+                RectF::new(
+                    list_box.x + 18.0,
+                    list_box.y + list_box.h - 20.0,
+                    list_box.w - 36.0,
+                    18.0,
+                ),
+                pal.text_muted,
+                0,
+                1,
+                false,
+            );
+        }
+
+        // 5. Modal Footer Action Buttons: [取消]  [重试]  [结束进程并重试]
+        let btn_y = modal.y + modal.h - 54.0;
+        let btn_cancel = RectF::new(modal.x + 22.0, btn_y, 96.0, 38.0);
+        self.renderer.draw_button(
+            btn_cancel,
+            "取消",
+            None,
+            ButtonVariant::Outlined,
+            btn_cancel.contains(mx, my),
+            true,
+            &pal,
+            &self.ripples,
+        );
+
+        let btn_retry = RectF::new(modal.x + modal.w - 302.0, btn_y, 112.0, 38.0);
+        self.renderer.draw_button(
+            btn_retry,
+            "重试",
+            None,
+            ButtonVariant::Tonal,
+            btn_retry.contains(mx, my),
+            true,
+            &pal,
+            &self.ripples,
+        );
+
+        let btn_kill_retry = RectF::new(modal.x + modal.w - 180.0, btn_y, 158.0, 38.0);
+        self.renderer.draw_button(
+            btn_kill_retry,
+            "结束进程并重试",
+            Some(VectorIcon::Rocket),
+            ButtonVariant::Filled,
+            btn_kill_retry.contains(mx, my),
+            true,
+            &pal,
+            &self.ripples,
+        );
+    }
+
+    fn current_log_box_rect(&self) -> Option<RectF> {
+        match &self.mode {
+            WizardMode::Installer { .. } => {
+                if self.step == WizardStep::Installing {
+                    let card = self.installer_card_rect();
+                    Some(RectF::new(
+                        card.x + 26.0,
+                        card.y + 112.0,
+                        card.w - 52.0,
+                        232.0,
+                    ))
+                } else {
+                    None
+                }
+            }
+            WizardMode::Uninstaller { .. } => {
+                if self.uninstall_done {
+                    let card = RectF::new(18.0, 52.0, self.width_dip - 36.0, self.height_dip - 68.0);
+                    Some(RectF::new(
+                        card.x + 26.0,
+                        card.y + 114.0,
+                        card.w - 52.0,
+                        270.0,
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn compute_log_scroll_metrics(&self, log_box: RectF) -> LogScrollMetrics {
+        let row_h = 22.0;
+        let pad_x = 12.0;
+        let pad_y = 8.0;
+        let scrollbar_reserve = 14.0;
+
+        let content_h = (self.logs.len() as f32) * row_h;
+        let content_w = self
+            .logs
+            .iter()
+            .map(|line| {
+                self.renderer
+                    .measure_text_width(line, &self.renderer.font_mono)
+            })
+            .fold(0.0_f32, f32::max);
+
+        let base_w = (log_box.w - pad_x * 2.0).max(40.0);
+        let base_h = (log_box.h - pad_y * 2.0).max(40.0);
+
+        let mut need_h = content_w > base_w + 1.0;
+        let mut avail_h = if need_h {
+            (base_h - scrollbar_reserve).max(20.0)
+        } else {
+            base_h
+        };
+        let need_v = content_h > avail_h + 1.0;
+        let avail_w = if need_v {
+            (base_w - scrollbar_reserve).max(20.0)
+        } else {
+            base_w
+        };
+        if !need_h && content_w > avail_w + 1.0 {
+            need_h = true;
+            avail_h = (base_h - scrollbar_reserve).max(20.0);
+        }
+
+        let viewport = RectF::new(log_box.x + pad_x, log_box.y + pad_y, avail_w, avail_h);
+        let max_scroll_x = (content_w - avail_w).max(0.0);
+        let max_scroll_y = (content_h - avail_h).max(0.0);
+        let scroll_x = self.log_scroll_x.clamp(0.0, max_scroll_x);
+        let scroll_y = if self.log_auto_scroll {
+            max_scroll_y
+        } else {
+            self.log_scroll_y.clamp(0.0, max_scroll_y)
+        };
+
+        let (h_track, h_thumb) = if need_h && max_scroll_x > 0.0 {
+            let track_w = (log_box.w - 20.0 - if need_v { scrollbar_reserve } else { 0.0 }).max(32.0);
+            let track = RectF::new(log_box.x + 10.0, log_box.y + log_box.h - 13.0, track_w, 7.0);
+            let thumb_w = ((avail_w / content_w.max(1.0)) * track.w).clamp(28.0, track.w);
+            let max_travel = (track.w - thumb_w).max(0.0);
+            let thumb_x = track.x + (scroll_x / max_scroll_x) * max_travel;
+            let thumb = RectF::new(thumb_x, track.y, thumb_w, track.h);
+            (Some(track), Some(thumb))
+        } else {
+            (None, None)
+        };
+
+        let (v_track, v_thumb) = if need_v && max_scroll_y > 0.0 {
+            let track_h = (log_box.h - 16.0 - if need_h { scrollbar_reserve } else { 0.0 }).max(32.0);
+            let track = RectF::new(log_box.x + log_box.w - 13.0, log_box.y + 8.0, 7.0, track_h);
+            let thumb_h = ((avail_h / content_h.max(1.0)) * track.h).clamp(28.0, track.h);
+            let max_travel = (track.h - thumb_h).max(0.0);
+            let thumb_y = track.y + (scroll_y / max_scroll_y) * max_travel;
+            let thumb = RectF::new(track.x, thumb_y, track.w, thumb_h);
+            (Some(track), Some(thumb))
+        } else {
+            (None, None)
+        };
+
+        LogScrollMetrics {
+            viewport,
+            row_h,
+            content_w,
+            max_scroll_x,
+            max_scroll_y,
+            scroll_x,
+            scroll_y,
+            h_track,
+            h_thumb,
+            v_track,
+            v_thumb,
+        }
+    }
+
+    fn draw_scrollable_log_box(&self, log_box: RectF, is_uninstaller_list: bool) {
+        let pal = self.palette;
+        let mx = self.mouse_x;
+        let my = self.mouse_y;
+
+        self.renderer
+            .fill_rounded_rect(log_box, 10.0, pal.surface_variant);
+        self.renderer
+            .draw_rounded_rect(log_box, 10.0, 1.0, pal.outline_subtle);
+
+        let m = self.compute_log_scroll_metrics(log_box);
+        unsafe {
+            self.renderer
+                .rt()
+                .PushAxisAlignedClip(&m.viewport.to_d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        }
+
+        let line_draw_w = m.content_w.max(m.viewport.w) + 32.0;
+        for (i, line) in self.logs.iter().enumerate() {
+            let ly = m.viewport.y + (i as f32) * m.row_h - m.scroll_y;
+            if ly + m.row_h < m.viewport.y || ly > m.viewport.y + m.viewport.h {
+                continue;
+            }
+            let col = if is_uninstaller_list {
+                if line.starts_with("[错误]") {
+                    pal.error
+                } else {
+                    pal.success
+                }
+            } else if line.starts_with("[错误]") {
+                pal.error
+            } else if line.starts_with("[进程管理]") || line.starts_with("[覆盖更新]") {
+                pal.warning
+            } else if line.starts_with("[完成]") {
+                pal.success
+            } else {
+                pal.text_secondary
+            };
+            self.renderer.draw_text(
+                line,
+                &self.renderer.font_mono,
+                RectF::new(m.viewport.x - m.scroll_x, ly, line_draw_w, m.row_h),
+                col,
+                0,
+                1,
+                false,
+            );
+        }
+
+        unsafe {
+            self.renderer.rt().PopAxisAlignedClip();
+        }
+
+        if let (Some(track), Some(thumb)) = (m.h_track, m.h_thumb) {
+            let hit_track = RectF::new(track.x, track.y - 5.0, track.w, track.h + 10.0);
+            let is_active = self.dragging_log_hscroll.is_some() || hit_track.contains(mx, my);
+            self.renderer
+                .fill_rounded_rect(track, 3.5, rgba(0x64748B, 0.16));
+            let thumb_col = if is_active {
+                pal.primary
+            } else {
+                rgba(0x64748B, 0.48)
+            };
+            self.renderer.fill_rounded_rect(thumb, 3.5, thumb_col);
+        }
+
+        if let (Some(track), Some(thumb)) = (m.v_track, m.v_thumb) {
+            let hit_track = RectF::new(track.x - 5.0, track.y, track.w + 10.0, track.h);
+            let is_active = self.dragging_log_vscroll.is_some() || hit_track.contains(mx, my);
+            self.renderer
+                .fill_rounded_rect(track, 3.5, rgba(0x64748B, 0.16));
+            let thumb_col = if is_active {
+                pal.primary
+            } else {
+                rgba(0x64748B, 0.48)
+            };
+            self.renderer.fill_rounded_rect(thumb, 3.5, thumb_col);
+        }
+    }
+
     fn draw_step_installing(&self, card: RectF) {
         let pal = self.palette;
         let mx = self.mouse_x;
@@ -1118,62 +1543,20 @@ impl InstallerWindowState {
         } else {
             pal.text_primary
         };
-        self.renderer.draw_text(
+        self.renderer.draw_text_ellipsis(
             &self.status_text,
             &self.renderer.font_body_bold,
             RectF::new(x0, card.y + 56.0, w_full, 22.0),
             status_color,
             0,
             1,
-            false,
         );
 
         let bar = RectF::new(x0, card.y + 86.0, w_full, 10.0);
         self.renderer.draw_progress_bar(bar, self.progress, &pal);
 
         let log_box = RectF::new(x0, card.y + 112.0, w_full, 232.0);
-        self.renderer
-            .fill_rounded_rect(log_box, 10.0, pal.surface_variant);
-        self.renderer
-            .draw_rounded_rect(log_box, 10.0, 1.0, pal.outline_subtle);
-
-        let wrapped_logs = self.renderer.wrap_log_lines(
-            &self.logs,
-            &self.renderer.font_mono,
-            log_box.w - 28.0,
-        );
-        let max_lines = 9usize;
-        let skip = wrapped_logs.len().saturating_sub(max_lines);
-        let log_clip = log_box.inset(8.0, 6.0);
-        unsafe {
-            self.renderer
-                .rt()
-                .PushAxisAlignedClip(&log_clip.to_d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        }
-        for (i, (orig, line)) in wrapped_logs.iter().skip(skip).enumerate() {
-            let ly = log_box.y + 12.0 + (i as f32) * 23.0;
-            let col = if orig.starts_with("[错误]") {
-                pal.error
-            } else if orig.starts_with("[进程管理]") || orig.starts_with("[覆盖更新]") {
-                pal.warning
-            } else if orig.starts_with("[完成]") {
-                pal.success
-            } else {
-                pal.text_secondary
-            };
-            self.renderer.draw_text(
-                line,
-                &self.renderer.font_mono,
-                RectF::new(log_box.x + 14.0, ly, log_box.w - 28.0, 20.0),
-                col,
-                0,
-                1,
-                false,
-            );
-        }
-        unsafe {
-            self.renderer.rt().PopAxisAlignedClip();
-        }
+        self.draw_scrollable_log_box(log_box, false);
 
         let footer_line_y = card.y + card.h - 62.0;
         self.renderer.draw_line(
@@ -1269,14 +1652,13 @@ impl InstallerWindowState {
             false,
         );
 
-        self.renderer.draw_text(
+        self.renderer.draw_text_ellipsis(
             &format!("安装位置: {}", self.install_dir_input),
             &self.renderer.font_mono,
             RectF::new(x0, card.y + 156.0, w_full, 22.0),
             pal.text_secondary,
             1,
             1,
-            false,
         );
 
         // Checkbox: Launch application now
@@ -1356,7 +1738,7 @@ impl InstallerWindowState {
             1,
             false,
         );
-        self.renderer.draw_text(
+        self.renderer.draw_text_ellipsis(
             &format!(
                 "目标目录: {} (共 {} 个文件)",
                 receipt.install_dir,
@@ -1367,14 +1749,9 @@ impl InstallerWindowState {
             pal.text_secondary,
             0,
             1,
-            false,
         );
 
         let log_box = RectF::new(x0, card.y + 114.0, w_full, 270.0);
-        self.renderer
-            .fill_rounded_rect(log_box, 10.0, pal.surface_variant);
-        self.renderer
-            .draw_rounded_rect(log_box, 10.0, 1.0, pal.outline_subtle);
 
         let footer_line_y = card.y + card.h - 62.0;
         self.renderer.draw_line(
@@ -1388,6 +1765,10 @@ impl InstallerWindowState {
         let btn_y = card.y + card.h - 50.0;
 
         if !self.uninstall_done {
+            self.renderer
+                .fill_rounded_rect(log_box, 10.0, pal.surface_variant);
+            self.renderer
+                .draw_rounded_rect(log_box, 10.0, 1.0, pal.outline_subtle);
             self.renderer.draw_text(
                 "点击下方“确认卸载并清理”将从您的电脑中移除以下内容：\n\n\
                 • 自动结束正在运行的目标程序进程\n\
@@ -1426,33 +1807,7 @@ impl InstallerWindowState {
                 &self.ripples,
             );
         } else {
-            let wrapped_logs = self.renderer.wrap_log_lines(
-                &self.logs,
-                &self.renderer.font_mono,
-                log_box.w - 28.0,
-            );
-            let skip = wrapped_logs.len().saturating_sub(10);
-            let log_clip = log_box.inset(8.0, 6.0);
-            unsafe {
-                self.renderer
-                    .rt()
-                    .PushAxisAlignedClip(&log_clip.to_d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            }
-            for (i, (_orig, line)) in wrapped_logs.iter().skip(skip).enumerate() {
-                let ly = log_box.y + 12.0 + (i as f32) * 23.0;
-                self.renderer.draw_text(
-                    line,
-                    &self.renderer.font_mono,
-                    RectF::new(log_box.x + 14.0, ly, log_box.w - 28.0, 20.0),
-                    pal.success,
-                    0,
-                    1,
-                    false,
-                );
-            }
-            unsafe {
-                self.renderer.rt().PopAxisAlignedClip();
-            }
+            self.draw_scrollable_log_box(log_box, true);
 
             let btn_close = RectF::new(card.x + card.w - 184.0, btn_y, 158.0, 38.0);
             self.renderer.draw_button(
@@ -1466,6 +1821,61 @@ impl InstallerWindowState {
                 &self.ripples,
             );
         }
+    }
+
+    fn try_begin_log_scrollbar_drag(&mut self, x: f32, y: f32) -> bool {
+        if self.show_process_conflict_modal {
+            return false;
+        }
+        let Some(log_box) = self.current_log_box_rect() else {
+            return false;
+        };
+        let m = self.compute_log_scroll_metrics(log_box);
+        self.log_scroll_x = m.scroll_x;
+        self.log_scroll_y = m.scroll_y;
+
+        if let (Some(track), Some(thumb)) = (m.h_track, m.h_thumb) {
+            let hit_track = RectF::new(track.x, track.y - 5.0, track.w, track.h + 10.0);
+            if hit_track.contains(x, y) {
+                if x >= thumb.x && x <= thumb.x + thumb.w {
+                    self.dragging_log_hscroll = Some(x - thumb.x);
+                } else {
+                    let grab_offset = thumb.w * 0.5;
+                    let max_travel = (track.w - thumb.w).max(1.0);
+                    let new_thumb_x = (x - grab_offset).clamp(track.x, track.x + max_travel);
+                    self.log_scroll_x = ((new_thumb_x - track.x) / max_travel) * m.max_scroll_x;
+                    self.dragging_log_hscroll = Some(x - new_thumb_x);
+                }
+                unsafe {
+                    let _ = SetCapture(self.hwnd);
+                }
+                self.invalidate();
+                return true;
+            }
+        }
+
+        if let (Some(track), Some(thumb)) = (m.v_track, m.v_thumb) {
+            let hit_track = RectF::new(track.x - 5.0, track.y, track.w + 10.0, track.h);
+            if hit_track.contains(x, y) {
+                self.log_auto_scroll = false;
+                if y >= thumb.y && y <= thumb.y + thumb.h {
+                    self.dragging_log_vscroll = Some(y - thumb.y);
+                } else {
+                    let grab_offset = thumb.h * 0.5;
+                    let max_travel = (track.h - thumb.h).max(1.0);
+                    let new_thumb_y = (y - grab_offset).clamp(track.y, track.y + max_travel);
+                    self.log_scroll_y = ((new_thumb_y - track.y) / max_travel) * m.max_scroll_y;
+                    self.dragging_log_vscroll = Some(y - new_thumb_y);
+                }
+                unsafe {
+                    let _ = SetCapture(self.hwnd);
+                }
+                self.invalidate();
+                return true;
+            }
+        }
+
+        false
     }
 
     pub fn on_lbutton_down(&mut self, x: f32, y: f32) {
@@ -1522,6 +1932,9 @@ impl InstallerWindowState {
 
         let is_uninstaller = matches!(self.mode, WizardMode::Uninstaller { .. });
         if is_uninstaller {
+            if self.try_begin_log_scrollbar_drag(x, y) {
+                return;
+            }
             let card = RectF::new(18.0, 52.0, w - 36.0, h - 68.0);
             let btn_y = card.y + card.h - 50.0;
             if !self.uninstall_done {
@@ -1534,6 +1947,9 @@ impl InstallerWindowState {
                 } else if btn_unins.contains(x, y) {
                     if let WizardMode::Uninstaller { ref receipt, .. } = self.mode {
                         self.logs = execute_uninstall_steps(receipt);
+                        self.log_scroll_x = 0.0;
+                        self.log_scroll_y = 0.0;
+                        self.log_auto_scroll = true;
                         self.uninstall_done = true;
                         self.invalidate();
                     }
@@ -1556,6 +1972,42 @@ impl InstallerWindowState {
             return;
         }
 
+        // Modal process conflict popup intercepts all content clicks when active
+        if self.show_process_conflict_modal {
+            let modal = self.process_conflict_modal_rect();
+            let btn_close_x = RectF::new(modal.x + modal.w - 42.0, modal.y + 14.0, 28.0, 28.0);
+            let btn_y = modal.y + modal.h - 54.0;
+            let btn_cancel = RectF::new(modal.x + 22.0, btn_y, 96.0, 38.0);
+            let btn_retry = RectF::new(modal.x + modal.w - 302.0, btn_y, 112.0, 38.0);
+            let btn_kill_retry = RectF::new(modal.x + modal.w - 180.0, btn_y, 158.0, 38.0);
+
+            if btn_close_x.contains(x, y) || btn_cancel.contains(x, y) {
+                self.show_process_conflict_modal = false;
+                self.invalidate();
+            } else if btn_retry.contains(x, y) {
+                self.add_ripple(x, y, btn_retry, rgba(0x6366F1, 0.22));
+                self.refresh_disk_space();
+                if self.running_processes.is_empty() {
+                    self.show_process_conflict_modal = false;
+                    self.opt_kill_running_process = false;
+                    self.start_installation();
+                } else {
+                    self.invalidate();
+                }
+            } else if btn_kill_retry.contains(x, y) {
+                self.add_ripple(x, y, btn_kill_retry, rgba(0xFFFFFF, 0.25));
+                self.terminate_occupying_processes();
+                self.show_process_conflict_modal = false;
+                self.opt_kill_running_process = true;
+                self.start_installation();
+            }
+            return;
+        }
+
+        if self.try_begin_log_scrollbar_drag(x, y) {
+            return;
+        }
+
         // Installer mode clicks
         let card = self.installer_card_rect();
         let x0 = card.x + 26.0;
@@ -1564,14 +2016,11 @@ impl InstallerWindowState {
 
         match self.step {
             WizardStep::WelcomeAndLicense => {
-                let chk_kill_welcome = RectF::new(x0, card.y + 318.0, w_full, 36.0);
                 let chk_rect = RectF::new(x0, btn_y, 280.0, 38.0);
                 let btn_custom = RectF::new(card.x + card.w - 332.0, btn_y, 136.0, 38.0);
                 let btn_quick = RectF::new(card.x + card.w - 184.0, btn_y, 158.0, 38.0);
 
-                if chk_kill_welcome.contains(x, y) {
-                    self.opt_kill_running_process = !self.opt_kill_running_process;
-                } else if chk_rect.contains(x, y) {
+                if chk_rect.contains(x, y) {
                     self.license_accepted = !self.license_accepted;
                 } else if btn_custom.contains(x, y) && self.license_accepted {
                     self.refresh_disk_space();
@@ -1580,16 +2029,15 @@ impl InstallerWindowState {
                     && self.license_accepted
                     && self.has_enough_disk_space()
                 {
-                    self.start_installation();
+                    self.try_begin_installation();
                 }
             }
             WizardStep::CustomOptions => {
                 let r_path = RectF::new(x0, card.y + 66.0, w_full - 134.0, 38.0);
                 let btn_browse = RectF::new(x0 + w_full - 122.0, card.y + 66.0, 122.0, 38.0);
-                let c1 = RectF::new(x0, card.y + 184.0, w_full, 36.0);
-                let c2 = RectF::new(x0, card.y + 222.0, w_full, 36.0);
-                let c3 = RectF::new(x0, card.y + 260.0, w_full, 36.0);
-                let c4 = RectF::new(x0, card.y + 298.0, w_full, 36.0);
+                let c1 = RectF::new(x0, card.y + 190.0, w_full, 40.0);
+                let c2 = RectF::new(x0, card.y + 234.0, w_full, 40.0);
+                let c3 = RectF::new(x0, card.y + 278.0, w_full, 40.0);
                 let btn_back = RectF::new(x0, btn_y, 120.0, 38.0);
                 let btn_install = RectF::new(card.x + card.w - 184.0, btn_y, 158.0, 38.0);
 
@@ -1639,15 +2087,13 @@ impl InstallerWindowState {
                     self.opt_start_menu_shortcut = !self.opt_start_menu_shortcut;
                 } else if c3.contains(x, y) {
                     self.opt_register_uninstaller = !self.opt_register_uninstaller;
-                } else if c4.contains(x, y) {
-                    self.opt_kill_running_process = !self.opt_kill_running_process;
                 } else if btn_back.contains(x, y) {
                     self.step = WizardStep::WelcomeAndLicense;
                 } else if btn_install.contains(x, y)
                     && self.has_enough_disk_space()
                     && !self.install_dir_input.trim().is_empty()
                 {
-                    self.start_installation();
+                    self.try_begin_installation();
                 }
             }
             WizardStep::Installing => {
@@ -1703,6 +2149,27 @@ impl InstallerWindowState {
         self.mouse_y = my;
         if !lbutton_down {
             self.text_input.is_dragging = false;
+            self.dragging_log_hscroll = None;
+            self.dragging_log_vscroll = None;
+        } else if let Some(grab_dx) = self.dragging_log_hscroll {
+            if let Some(log_box) = self.current_log_box_rect() {
+                let m = self.compute_log_scroll_metrics(log_box);
+                if let (Some(track), Some(thumb)) = (m.h_track, m.h_thumb) {
+                    let max_travel = (track.w - thumb.w).max(1.0);
+                    let new_thumb_x = (mx - grab_dx).clamp(track.x, track.x + max_travel);
+                    self.log_scroll_x = ((new_thumb_x - track.x) / max_travel) * m.max_scroll_x;
+                }
+            }
+        } else if let Some(grab_dy) = self.dragging_log_vscroll {
+            if let Some(log_box) = self.current_log_box_rect() {
+                let m = self.compute_log_scroll_metrics(log_box);
+                if let (Some(track), Some(thumb)) = (m.v_track, m.v_thumb) {
+                    let max_travel = (track.h - thumb.h).max(1.0);
+                    let new_thumb_y = (my - grab_dy).clamp(track.y, track.y + max_travel);
+                    self.log_scroll_y = ((new_thumb_y - track.y) / max_travel) * m.max_scroll_y;
+                    self.log_auto_scroll = (self.log_scroll_y - m.max_scroll_y).abs() < 2.0;
+                }
+            }
         } else if self.text_input.is_dragging
             && self.path_focused
             && self.step == WizardStep::CustomOptions
@@ -1830,6 +2297,31 @@ impl InstallerWindowState {
     }
 
     pub fn on_mouse_wheel(&mut self, delta: i16) {
+        if !self.show_process_conflict_modal {
+            if let Some(log_box) = self.current_log_box_rect() {
+                let m = self.compute_log_scroll_metrics(log_box);
+                let shift_down = unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 };
+                let step = 44.0;
+                if (shift_down || m.max_scroll_y <= 0.0) && m.max_scroll_x > 0.0 {
+                    if delta < 0 {
+                        self.log_scroll_x = (m.scroll_x + step).min(m.max_scroll_x);
+                    } else {
+                        self.log_scroll_x = (m.scroll_x - step).max(0.0);
+                    }
+                    self.invalidate();
+                } else if m.max_scroll_y > 0.0 {
+                    if delta < 0 {
+                        self.log_scroll_y = (m.scroll_y + step).min(m.max_scroll_y);
+                    } else {
+                        self.log_scroll_y = (m.scroll_y - step).max(0.0);
+                    }
+                    self.log_auto_scroll = (self.log_scroll_y - m.max_scroll_y).abs() < 2.0;
+                    self.invalidate();
+                }
+                return;
+            }
+        }
+
         if self.step == WizardStep::WelcomeAndLicense {
             if let WizardMode::Installer { ref manifest, .. } = self.mode {
                 let total_lines = manifest.config.license_text.lines().count();
@@ -2021,6 +2513,12 @@ unsafe extern "system" fn installer_wnd_proc(
         }
         WM_LBUTTONUP => {
             state.text_input.is_dragging = false;
+            if state.dragging_log_hscroll.is_some() || state.dragging_log_vscroll.is_some() {
+                state.dragging_log_hscroll = None;
+                state.dragging_log_vscroll = None;
+                let _ = ReleaseCapture();
+                state.invalidate();
+            }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {

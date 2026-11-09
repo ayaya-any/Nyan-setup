@@ -1237,6 +1237,86 @@ impl D2DRenderer {
         }
     }
 
+    /// Truncate single-line text and append `"..."` if its rendered width exceeds `max_width`.
+    pub fn ellipsize_text(&self, text: &str, fmt: &IDWriteTextFormat, max_width: f32) -> String {
+        let limit = (max_width - 2.0).max(0.0);
+        if self.measure_text_width(text, fmt) <= limit {
+            return text.to_string();
+        }
+        let ellipsis = "...";
+        if self.measure_text_width(ellipsis, fmt) >= limit {
+            return ellipsis.to_string();
+        }
+        let char_indices: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        let mut low = 0usize;
+        let mut high = char_indices.len();
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            let byte_end = if mid < char_indices.len() {
+                char_indices[mid]
+            } else {
+                text.len()
+            };
+            let candidate = format!("{}{}", &text[..byte_end], ellipsis);
+            if self.measure_text_width(&candidate, fmt) <= limit {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let byte_end = if low < char_indices.len() {
+            char_indices[low]
+        } else {
+            text.len()
+        };
+        format!("{}{}", text[..byte_end].trim_end(), ellipsis)
+    }
+
+    /// Draw single-line text preserving `fmt` size/weight and formatting overflow at the end as `"..."`.
+    pub fn draw_text_ellipsis(
+        &self,
+        text: &str,
+        fmt: &IDWriteTextFormat,
+        rect: RectF,
+        color: D2D1_COLOR_F,
+        h_align: i32,
+        v_align: i32,
+    ) {
+        unsafe {
+            let display = if rect.w > 8.0 {
+                self.ellipsize_text(text, fmt, rect.w)
+            } else {
+                text.to_string()
+            };
+            let _ = fmt.SetTextAlignment(match h_align {
+                1 => DWRITE_TEXT_ALIGNMENT_CENTER,
+                2 => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                _ => DWRITE_TEXT_ALIGNMENT_LEADING,
+            });
+            let _ = fmt.SetParagraphAlignment(match v_align {
+                1 => DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                _ => DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+            });
+            let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            let no_trim = DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_NONE,
+                delimiter: 0,
+                delimiterCount: 0,
+            };
+            let _ = fmt.SetTrimming(&no_trim, None);
+
+            let wide: Vec<u16> = display.encode_utf16().collect();
+            self.rt().DrawText(
+                &wide,
+                fmt,
+                &rect.to_d2d(),
+                self.brush(color),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+        }
+    }
+
     pub fn draw_text(
         &self,
         text: &str,
@@ -1265,6 +1345,15 @@ impl D2DRenderer {
                 }
             }
 
+            let display_cow = if !wrap
+                && rect.w > 8.0
+                && self.measure_text_width(text, active_fmt) > rect.w - 1.0
+            {
+                std::borrow::Cow::Owned(self.ellipsize_text(text, active_fmt, rect.w))
+            } else {
+                std::borrow::Cow::Borrowed(text)
+            };
+
             let _ = active_fmt.SetTextAlignment(match h_align {
                 1 => DWRITE_TEXT_ALIGNMENT_CENTER,
                 2 => DWRITE_TEXT_ALIGNMENT_TRAILING,
@@ -1286,7 +1375,7 @@ impl D2DRenderer {
             };
             let _ = active_fmt.SetTrimming(&no_trim, None);
 
-            let wide: Vec<u16> = text.encode_utf16().collect();
+            let wide: Vec<u16> = display_cow.encode_utf16().collect();
             self.rt().DrawText(
                 &wide,
                 active_fmt,

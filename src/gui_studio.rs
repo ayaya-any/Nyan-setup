@@ -4,7 +4,8 @@ use crate::d2d::{
 };
 use crate::package::{
     build_installer_package, collect_source_files, format_bytes, BuildProgressEvent, CheckOperator,
-    PackageConfig, PrereqAction, PrereqCondition, PrerequisiteRule, RegArchView, RegHiveRoot,
+    PackageConfig, PrereqAction, PrereqCondition, PrerequisiteRule, ProcessConflictPolicy,
+    RegArchView, RegHiveRoot,
 };
 use crate::win32_ops::{
     create_demo_app_directory, evaluate_prereq_condition, get_clipboard_text, pick_folder_dialog,
@@ -1278,18 +1279,18 @@ impl StudioWindowState {
             "配置快捷方式生成、控制面板卸载注册、数据压缩比及终端用户许可协议 (EULA)。",
         );
 
-        // Left column: 5 Checkboxes (y = card.y + 88..348)
+        // Left column: 4 Checkboxes + Process Conflict Policy + Compression Level
         self.renderer.draw_text(
-            "默认安装与覆盖更新行为",
+            "默认快捷方式与安装行为",
             &self.renderer.font_body_bold,
-            RectF::new(x0 + 4.0, card.y + 86.0, left_w, 20.0),
+            RectF::new(x0 + 4.0, card.y + 84.0, left_w, 20.0),
             pal.text_primary,
             0,
             1,
             false,
         );
 
-        let c1 = RectF::new(x0, card.y + 110.0, left_w, 44.0);
+        let c1 = RectF::new(x0, card.y + 108.0, left_w, 42.0);
         self.renderer.draw_checkbox(
             c1,
             self.config.create_desktop_shortcut,
@@ -1299,7 +1300,7 @@ impl StudioWindowState {
             &pal,
         );
 
-        let c2 = RectF::new(x0, card.y + 158.0, left_w, 44.0);
+        let c2 = RectF::new(x0, card.y + 152.0, left_w, 42.0);
         self.renderer.draw_checkbox(
             c2,
             self.config.create_start_menu_shortcut,
@@ -1309,7 +1310,7 @@ impl StudioWindowState {
             &pal,
         );
 
-        let c3 = RectF::new(x0, card.y + 206.0, left_w, 44.0);
+        let c3 = RectF::new(x0, card.y + 196.0, left_w, 42.0);
         self.renderer.draw_checkbox(
             c3,
             self.config.register_uninstaller,
@@ -1319,7 +1320,7 @@ impl StudioWindowState {
             &pal,
         );
 
-        let c4 = RectF::new(x0, card.y + 254.0, left_w, 44.0);
+        let c4 = RectF::new(x0, card.y + 240.0, left_w, 42.0);
         self.renderer.draw_checkbox(
             c4,
             self.config.auto_launch_after_install,
@@ -1329,21 +1330,69 @@ impl StudioWindowState {
             &pal,
         );
 
-        let c5 = RectF::new(x0, card.y + 302.0, left_w, 44.0);
-        self.renderer.draw_checkbox(
-            c5,
-            self.config.kill_process_on_update,
-            c5.contains(mx, my),
-            "更新时自动结束运行中的进程",
-            Some("覆盖更新前自动终止同名进程以防文件占用"),
-            &pal,
+        // Process Conflict Policy Selector (y = card.y + 292..374)
+        self.renderer.draw_text(
+            "安装/更新时进程占用处理策略",
+            &self.renderer.font_body_bold,
+            RectF::new(x0 + 4.0, card.y + 292.0, left_w, 20.0),
+            pal.text_primary,
+            0,
+            1,
+            false,
         );
 
-        // Compression Level Selector (y = card.y + 356..420)
+        let pol_w = (left_w - 8.0) * 0.5;
+        let btn_pol_auto = RectF::new(x0, card.y + 316.0, pol_w, 34.0);
+        let btn_pol_prompt = RectF::new(x0 + pol_w + 8.0, card.y + 316.0, pol_w, 34.0);
+        self.renderer.draw_button(
+            btn_pol_auto,
+            "自动结束占用进程",
+            None,
+            if self.config.process_conflict_policy == ProcessConflictPolicy::AutoKill {
+                ButtonVariant::Filled
+            } else {
+                ButtonVariant::Outlined
+            },
+            btn_pol_auto.contains(mx, my),
+            true,
+            &pal,
+            &self.ripples,
+        );
+        self.renderer.draw_button(
+            btn_pol_prompt,
+            "弹出提示窗口",
+            None,
+            if self.config.process_conflict_policy == ProcessConflictPolicy::PromptUser {
+                ButtonVariant::Filled
+            } else {
+                ButtonVariant::Outlined
+            },
+            btn_pol_prompt.contains(mx, my),
+            true,
+            &pal,
+            &self.ripples,
+        );
+        let pol_hint = match self.config.process_conflict_policy {
+            ProcessConflictPolicy::AutoKill => "检测到目标程序运行时，自动静默结束进程并继续安装",
+            ProcessConflictPolicy::PromptUser => {
+                "检测到占用时弹窗列出运行进程，提供“重试”与“结束进程并重试”"
+            }
+        };
+        self.renderer.draw_text(
+            pol_hint,
+            &self.renderer.font_caption,
+            RectF::new(x0 + 4.0, card.y + 354.0, left_w, 18.0),
+            pal.text_secondary,
+            0,
+            1,
+            false,
+        );
+
+        // Compression Level Selector (y = card.y + 382..444)
         self.renderer.draw_text(
             "LZMA2 固实压缩 + x86 BCJ 字典等级",
             &self.renderer.font_body_bold,
-            RectF::new(x0 + 4.0, card.y + 356.0, left_w, 20.0),
+            RectF::new(x0 + 4.0, card.y + 382.0, left_w, 20.0),
             pal.text_primary,
             0,
             1,
@@ -1353,7 +1402,7 @@ impl StudioWindowState {
         let levels = [(1u32, "快速 (Lv.1)"), (6u32, "标准 (Lv.6)"), (9u32, "极限 (Lv.9)")];
         let seg_w = (left_w - 16.0) / 3.0;
         for (i, (lv, label)) in levels.iter().enumerate() {
-            let sr = RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 382.0, seg_w, 36.0);
+            let sr = RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 408.0, seg_w, 36.0);
             let variant = if self.config.compression_level == *lv {
                 ButtonVariant::Filled
             } else {
@@ -2647,11 +2696,13 @@ impl StudioWindowState {
                 let left_w = 304.0;
                 let right_x = x0 + left_w + 20.0;
                 let right_w = w_full - left_w - 20.0;
-                let c1 = RectF::new(x0, card.y + 110.0, left_w, 44.0);
-                let c2 = RectF::new(x0, card.y + 158.0, left_w, 44.0);
-                let c3 = RectF::new(x0, card.y + 206.0, left_w, 44.0);
-                let c4 = RectF::new(x0, card.y + 254.0, left_w, 44.0);
-                let c5 = RectF::new(x0, card.y + 302.0, left_w, 44.0);
+                let c1 = RectF::new(x0, card.y + 108.0, left_w, 42.0);
+                let c2 = RectF::new(x0, card.y + 152.0, left_w, 42.0);
+                let c3 = RectF::new(x0, card.y + 196.0, left_w, 42.0);
+                let c4 = RectF::new(x0, card.y + 240.0, left_w, 42.0);
+                let pol_w = (left_w - 8.0) * 0.5;
+                let btn_pol_auto = RectF::new(x0, card.y + 316.0, pol_w, 34.0);
+                let btn_pol_prompt = RectF::new(x0 + pol_w + 8.0, card.y + 316.0, pol_w, 34.0);
 
                 if c1.contains(x, y) {
                     self.config.create_desktop_shortcut = !self.config.create_desktop_shortcut;
@@ -2662,15 +2713,21 @@ impl StudioWindowState {
                     self.config.register_uninstaller = !self.config.register_uninstaller;
                 } else if c4.contains(x, y) {
                     self.config.auto_launch_after_install = !self.config.auto_launch_after_install;
-                } else if c5.contains(x, y) {
-                    self.config.kill_process_on_update = !self.config.kill_process_on_update;
+                } else if btn_pol_auto.contains(x, y) {
+                    self.config.process_conflict_policy = ProcessConflictPolicy::AutoKill;
+                    self.config.kill_process_on_update = true;
+                    self.add_ripple(x, y, btn_pol_auto, rgba(0xFFFFFF, 0.25));
+                } else if btn_pol_prompt.contains(x, y) {
+                    self.config.process_conflict_policy = ProcessConflictPolicy::PromptUser;
+                    self.config.kill_process_on_update = false;
+                    self.add_ripple(x, y, btn_pol_prompt, rgba(0xFFFFFF, 0.25));
                 }
 
                 let levels = [1u32, 6u32, 9u32];
                 let seg_w = (left_w - 16.0) / 3.0;
                 for (i, lv) in levels.iter().enumerate() {
                     let sr =
-                        RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 382.0, seg_w, 36.0);
+                        RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 408.0, seg_w, 36.0);
                     if sr.contains(x, y) {
                         self.config.compression_level = *lv;
                     }

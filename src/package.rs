@@ -319,6 +319,21 @@ impl PrerequisiteRule {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessConflictPolicy {
+    /// 自动静默结束正在运行的目标程序进程并继续安装
+    AutoKill,
+    /// 弹出提示窗口列出占用的进程，提供「重试」与「结束进程并重试」两种选择
+    PromptUser,
+}
+
+impl Default for ProcessConflictPolicy {
+    fn default() -> Self {
+        Self::AutoKill
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageConfig {
     pub app_id: String,
@@ -332,6 +347,8 @@ pub struct PackageConfig {
     pub create_start_menu_shortcut: bool,
     pub register_uninstaller: bool,
     pub auto_launch_after_install: bool,
+    #[serde(default)]
+    pub process_conflict_policy: ProcessConflictPolicy,
     #[serde(default = "default_true")]
     pub kill_process_on_update: bool,
     pub compression_level: u32,
@@ -355,6 +372,7 @@ impl Default for PackageConfig {
             create_start_menu_shortcut: true,
             register_uninstaller: true,
             auto_launch_after_install: true,
+            process_conflict_policy: ProcessConflictPolicy::AutoKill,
             kill_process_on_update: true,
             compression_level: 6,
             installer_icon: None,
@@ -969,22 +987,23 @@ pub fn extract_package_files(
         }
     }
 
-    let mut exe_names: Vec<String> = manifest
+    let mut candidate_files: Vec<String> = manifest
         .files
         .iter()
-        .filter(|f| {
-            !f.relative_path.starts_with(PREREQ_VIRTUAL_PREFIX)
-                && f.relative_path.to_ascii_lowercase().ends_with(".exe")
-        })
+        .filter(|f| !f.relative_path.starts_with(PREREQ_VIRTUAL_PREFIX))
         .map(|f| f.relative_path.clone())
         .collect();
-    if !manifest.config.main_exe.is_empty() && !exe_names.contains(&manifest.config.main_exe) {
-        exe_names.push(manifest.config.main_exe.clone());
+    if !manifest.config.main_exe.is_empty()
+        && !candidate_files.contains(&manifest.config.main_exe)
+    {
+        candidate_files.push(manifest.config.main_exe.clone());
     }
 
     if kill_locked_processes {
-        let killed_msgs =
-            crate::win32_ops::terminate_running_target_processes(target_install_dir, &exe_names);
+        let killed_msgs = crate::win32_ops::terminate_running_target_processes(
+            target_install_dir,
+            &candidate_files,
+        );
         if let Some(tx) = progress_tx {
             for msg in killed_msgs {
                 let _ = tx.send(InstallProgressEvent::KillingProcesses(msg));
@@ -1092,7 +1111,7 @@ pub fn extract_package_files(
             for _ in 0..6 {
                 let killed = crate::win32_ops::terminate_running_target_processes(
                     target_install_dir,
-                    &exe_names,
+                    &candidate_files,
                 );
                 if let Some(tx) = progress_tx {
                     for msg in killed {
