@@ -39,6 +39,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "material-icons"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51749189f2b4bf6a522337b504a85a543b5e2af670cb08bcf48297ada61dc2d7"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -50,6 +56,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "lzma-rust",
+ "material-icons",
  "serde",
  "serde_json",
  "windows",

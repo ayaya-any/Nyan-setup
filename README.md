@@ -9,6 +9,7 @@
 - **高压缩率归档**：内置 x86 BCJ 指令预处理与固实 Solid LZMA2 字典压缩，有效缩减安装包体积。
 - **单执行文件架构**：安装包采用自解压 Stub + 固实压缩流 + 尾部清单架构，单个可执行文件即可独立运行。
 - **PE 资源动态注入**：支持打包时指定自定义 `.ico` 图标，自动通过 Windows UpdateResource API 重构替换 PE 内部图标资源。
+- **前置环境检测与部署**：支持在打包时声明注册表键值检测（`HKLM` / `HKCU` / `HKCR` / `HKU`、32/64 位视图）或系统文件及 PE 版本（`VS_FIXEDFILEINFO`）校验规则；条件不满足时可自动解压并静默执行随包附带的运行库（如 `vc_redist.x64.exe`）、运行自定义命令或弹窗提示。
 - **深度卸载清理**：
   - 自动检测并安全终止安装目录内运行的目标进程；
   - 递归清理文件与空子目录，结合安全目录校验机制自销毁安装根目录；
@@ -66,7 +67,30 @@ nyan-setup.exe pack --config package.json --icon resources\app.ico
   "source_dir": "./build_output",
   "output_exe": "./dist/ExampleApp_Setup.exe",
   "create_desktop_shortcut": true,
-  "create_start_menu_shortcut": true
+  "create_start_menu_shortcut": true,
+  "prerequisites": [
+    {
+      "name": "Microsoft VC++ 2015-2022 运行库 (x64)",
+      "enabled": true,
+      "condition": {
+        "kind": "registry",
+        "root": "hklm",
+        "subkey": "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
+        "value_name": "Installed",
+        "arch_view": "x64",
+        "operator": "equals",
+        "expected": "1"
+      },
+      "action": {
+        "kind": "run_bundled_exe",
+        "source_file": "./redist/vc_redist.x64.exe",
+        "args": "/install /quiet /norestart",
+        "elevate": true,
+        "wait": true,
+        "success_exit_codes": [0, 1638, 3010]
+      }
+    }
+  ]
 }
 ```
 

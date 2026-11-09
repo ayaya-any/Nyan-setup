@@ -1,13 +1,14 @@
 use crate::d2d::{
-    rgb, rgba, ButtonVariant, D2DRenderer, MaterialPalette, RectF, RippleEffect, ThemeMode,
-    VectorIcon,
+    rgb, rgba, ButtonVariant, D2DRenderer, MaterialPalette, RectF, RippleEffect, TextInputState,
+    ThemeMode, VectorIcon,
 };
 use crate::package::{
-    build_installer_package, collect_source_files, format_bytes, BuildProgressEvent, PackageConfig,
+    build_installer_package, collect_source_files, format_bytes, BuildProgressEvent, CheckOperator,
+    PackageConfig, PrereqAction, PrereqCondition, PrerequisiteRule, RegArchView, RegHiveRoot,
 };
 use crate::win32_ops::{
-    create_demo_app_directory, get_clipboard_text, pick_folder_dialog, pick_open_file_dialog,
-    pick_save_exe_dialog, shell_open, to_wide,
+    create_demo_app_directory, evaluate_prereq_condition, get_clipboard_text, pick_folder_dialog,
+    pick_open_file_dialog, pick_save_exe_dialog, set_clipboard_text, shell_open, to_wide,
 };
 use std::env;
 use std::fs;
@@ -24,7 +25,8 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTS
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_TAB,
+    GetKeyState, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE,
+    VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
@@ -32,9 +34,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
     CREATESTRUCTW, CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCAPTION, IDC_ARROW,
     ICON_BIG, ICON_SMALL, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WM_CHAR,
-    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETICON, WM_SIZE, WM_TIMER, WM_USER, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETICON, WM_SIZE,
+    WM_TIMER, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 
 const WM_APP_BUILD_EVENT: u32 = WM_USER + 101;
@@ -49,7 +51,8 @@ pub enum StudioTab {
     Metadata = 0,
     FilesAndPaths = 1,
     OptionsAndLicense = 2,
-    BuildAndTest = 3,
+    Prerequisites = 3,
+    BuildAndTest = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +67,22 @@ pub enum FocusedField {
     SourceDir,
     DefaultInstallDir,
     OutputExe,
+    PrereqName,
+    PrereqTarget,
+    PrereqValueName,
+    PrereqExpected,
+    PrereqActionPrimary,
+    PrereqActionSecondary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrereqDropdown {
+    ConditionKind,
+    RegHive,
+    RegArch,
+    Operator,
+    ActionKind,
+    ElevateMode,
 }
 
 pub struct StudioWindowState {
@@ -76,6 +95,8 @@ pub struct StudioWindowState {
     pub mouse_y: f32,
     pub active_tab: StudioTab,
     pub focused_field: FocusedField,
+    pub text_input: TextInputState,
+    pub open_dropdown: Option<PrereqDropdown>,
     pub caret_visible: bool,
     pub ripples: Vec<RippleEffect>,
 
@@ -84,6 +105,7 @@ pub struct StudioWindowState {
     pub source_dir: String,
     pub output_exe: String,
     pub installer_icon_input: String,
+    pub selected_prereq_idx: usize,
 
     // Scanned source directory preview
     pub scanned_files: Vec<(String, u64)>,
@@ -118,12 +140,15 @@ impl StudioWindowState {
             mouse_y: -1.0,
             active_tab: StudioTab::Metadata,
             focused_field: FocusedField::None,
+            text_input: TextInputState::new(),
+            open_dropdown: None,
             caret_visible: true,
             ripples: Vec::new(),
             config: PackageConfig::default(),
             source_dir: default_src.to_string_lossy().to_string(),
             output_exe: default_out.to_string_lossy().to_string(),
             installer_icon_input: String::new(),
+            selected_prereq_idx: 0,
             scanned_files: Vec::new(),
             scanned_total_bytes: 0,
             file_scroll_offset: 0,
@@ -197,7 +222,183 @@ impl StudioWindowState {
         }
     }
 
+    pub fn field_value_ref(&self, field: FocusedField) -> Option<&str> {
+        let idx = self.selected_prereq_idx;
+        match field {
+            FocusedField::None => None,
+            FocusedField::AppName => Some(&self.config.app_name),
+            FocusedField::AppVersion => Some(&self.config.app_version),
+            FocusedField::Publisher => Some(&self.config.publisher),
+            FocusedField::AppId => Some(&self.config.app_id),
+            FocusedField::MainExe => Some(&self.config.main_exe),
+            FocusedField::InstallerIcon => Some(&self.installer_icon_input),
+            FocusedField::SourceDir => Some(&self.source_dir),
+            FocusedField::DefaultInstallDir => Some(&self.config.default_install_dir),
+            FocusedField::OutputExe => Some(&self.output_exe),
+            FocusedField::PrereqName => self
+                .config
+                .prerequisites
+                .get(idx)
+                .map(|r| r.name.as_str()),
+            FocusedField::PrereqTarget => self
+                .config
+                .prerequisites
+                .get(idx)
+                .map(|r| match &r.condition {
+                    PrereqCondition::Registry { subkey, .. } => subkey.as_str(),
+                    PrereqCondition::File { path, .. } => path.as_str(),
+                }),
+            FocusedField::PrereqValueName => self.config.prerequisites.get(idx).and_then(|r| {
+                if let PrereqCondition::Registry { value_name, .. } = &r.condition {
+                    Some(value_name.as_str())
+                } else {
+                    None
+                }
+            }),
+            FocusedField::PrereqExpected => self
+                .config
+                .prerequisites
+                .get(idx)
+                .map(|r| match &r.condition {
+                    PrereqCondition::Registry { expected, .. } => expected.as_str(),
+                    PrereqCondition::File {
+                        expected_version, ..
+                    } => expected_version.as_str(),
+                }),
+            FocusedField::PrereqActionPrimary => self
+                .config
+                .prerequisites
+                .get(idx)
+                .map(|r| match &r.action {
+                    PrereqAction::RunBundledExe { source_file, .. } => source_file.as_str(),
+                    PrereqAction::RunCommand { program, .. } => program.as_str(),
+                    PrereqAction::PromptAndAbort { message, .. } => message.as_str(),
+                }),
+            FocusedField::PrereqActionSecondary => self
+                .config
+                .prerequisites
+                .get(idx)
+                .map(|r| match &r.action {
+                    PrereqAction::RunBundledExe { args, .. } => args.as_str(),
+                    PrereqAction::RunCommand { args, .. } => args.as_str(),
+                    PrereqAction::PromptAndAbort { download_url, .. } => download_url.as_str(),
+                }),
+        }
+    }
+
+    pub fn field_rect(&self, field: FocusedField) -> Option<RectF> {
+        let card = self.content_card_rect();
+        let x0 = card.x + 28.0;
+        let w_full = card.w - 56.0;
+        let w_half = (w_full - 20.0) * 0.5;
+        let right_x = x0 + 230.0;
+        let right_w = w_full - 230.0;
+        let ex = right_x + 16.0;
+        let ew = right_w - 32.0;
+        let idx = self.selected_prereq_idx;
+
+        match field {
+            FocusedField::None => None,
+            FocusedField::AppName => Some(RectF::new(x0, card.y + 112.0, w_half, 38.0)),
+            FocusedField::AppVersion => {
+                Some(RectF::new(x0 + w_half + 20.0, card.y + 112.0, w_half, 38.0))
+            }
+            FocusedField::Publisher => Some(RectF::new(x0, card.y + 182.0, w_half, 38.0)),
+            FocusedField::AppId => {
+                Some(RectF::new(x0 + w_half + 20.0, card.y + 182.0, w_half, 38.0))
+            }
+            FocusedField::MainExe => Some(RectF::new(x0, card.y + 252.0, w_half - 100.0, 38.0)),
+            FocusedField::InstallerIcon => Some(RectF::new(
+                x0 + w_half + 20.0,
+                card.y + 252.0,
+                w_half - 100.0,
+                38.0,
+            )),
+            FocusedField::SourceDir => Some(RectF::new(x0, card.y + 112.0, w_full - 138.0, 38.0)),
+            FocusedField::DefaultInstallDir => {
+                Some(RectF::new(x0, card.y + 180.0, w_full - 246.0, 38.0))
+            }
+            FocusedField::OutputExe => Some(RectF::new(x0, card.y + 248.0, w_full - 138.0, 38.0)),
+            FocusedField::PrereqName => Some(RectF::new(ex, card.y + 152.0, ew - 178.0, 34.0)),
+            FocusedField::PrereqTarget => {
+                let rule = self.config.prerequisites.get(idx)?;
+                match &rule.condition {
+                    PrereqCondition::Registry { .. } => {
+                        Some(RectF::new(ex + 204.0, card.y + 210.0, ew - 204.0, 34.0))
+                    }
+                    PrereqCondition::File { .. } => {
+                        Some(RectF::new(ex, card.y + 210.0, ew, 34.0))
+                    }
+                }
+            }
+            FocusedField::PrereqValueName => {
+                let rule = self.config.prerequisites.get(idx)?;
+                match &rule.condition {
+                    PrereqCondition::Registry { .. } => {
+                        Some(RectF::new(ex, card.y + 268.0, 130.0, 34.0))
+                    }
+                    PrereqCondition::File { .. } => None,
+                }
+            }
+            FocusedField::PrereqExpected => {
+                let rule = self.config.prerequisites.get(idx)?;
+                match &rule.condition {
+                    PrereqCondition::Registry { .. } => {
+                        Some(RectF::new(ex + 268.0, card.y + 268.0, ew - 268.0, 34.0))
+                    }
+                    PrereqCondition::File { .. } => {
+                        Some(RectF::new(ex + 156.0, card.y + 268.0, ew - 156.0, 34.0))
+                    }
+                }
+            }
+            FocusedField::PrereqActionPrimary => {
+                let rule = self.config.prerequisites.get(idx)?;
+                match &rule.action {
+                    PrereqAction::RunBundledExe { .. } => {
+                        Some(RectF::new(ex, card.y + 388.0, ew - 96.0, 34.0))
+                    }
+                    PrereqAction::RunCommand { .. } | PrereqAction::PromptAndAbort { .. } => {
+                        Some(RectF::new(ex, card.y + 388.0, ew, 34.0))
+                    }
+                }
+            }
+            FocusedField::PrereqActionSecondary => {
+                let rule = self.config.prerequisites.get(idx)?;
+                match &rule.action {
+                    PrereqAction::RunBundledExe { .. } | PrereqAction::RunCommand { .. } => {
+                        Some(RectF::new(ex, card.y + 448.0, ew - 134.0, 34.0))
+                    }
+                    PrereqAction::PromptAndAbort { .. } => {
+                        Some(RectF::new(ex, card.y + 448.0, ew, 34.0))
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn click_text_field(&mut self, field: FocusedField, rect: RectF, click_x: f32) {
+        let shift_down = unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 };
+        let val = self.field_value_ref(field).unwrap_or("").to_string();
+        let cur_caret = if self.focused_field == field {
+            self.text_input.caret_pos
+        } else {
+            0
+        };
+        let char_idx =
+            self.renderer
+                .hit_test_text_field_char(rect, &val, click_x, cur_caret);
+        if self.focused_field == field && shift_down {
+            self.text_input.set_caret(&val, char_idx, true);
+        } else {
+            self.focused_field = field;
+            self.text_input.set_caret(&val, char_idx, false);
+        }
+        self.text_input.is_dragging = true;
+        self.caret_visible = true;
+    }
+
     pub fn active_field_mut(&mut self) -> Option<&mut String> {
+        let idx = self.selected_prereq_idx;
         match self.focused_field {
             FocusedField::None => None,
             FocusedField::AppName => Some(&mut self.config.app_name),
@@ -209,6 +410,54 @@ impl StudioWindowState {
             FocusedField::SourceDir => Some(&mut self.source_dir),
             FocusedField::DefaultInstallDir => Some(&mut self.config.default_install_dir),
             FocusedField::OutputExe => Some(&mut self.output_exe),
+            FocusedField::PrereqName => self
+                .config
+                .prerequisites
+                .get_mut(idx)
+                .map(|r| &mut r.name),
+            FocusedField::PrereqTarget => self
+                .config
+                .prerequisites
+                .get_mut(idx)
+                .map(|r| match &mut r.condition {
+                    PrereqCondition::Registry { subkey, .. } => subkey,
+                    PrereqCondition::File { path, .. } => path,
+                }),
+            FocusedField::PrereqValueName => self.config.prerequisites.get_mut(idx).and_then(|r| {
+                if let PrereqCondition::Registry { value_name, .. } = &mut r.condition {
+                    Some(value_name)
+                } else {
+                    None
+                }
+            }),
+            FocusedField::PrereqExpected => self
+                .config
+                .prerequisites
+                .get_mut(idx)
+                .map(|r| match &mut r.condition {
+                    PrereqCondition::Registry { expected, .. } => expected,
+                    PrereqCondition::File {
+                        expected_version, ..
+                    } => expected_version,
+                }),
+            FocusedField::PrereqActionPrimary => self
+                .config
+                .prerequisites
+                .get_mut(idx)
+                .map(|r| match &mut r.action {
+                    PrereqAction::RunBundledExe { source_file, .. } => source_file,
+                    PrereqAction::RunCommand { program, .. } => program,
+                    PrereqAction::PromptAndAbort { message, .. } => message,
+                }),
+            FocusedField::PrereqActionSecondary => self
+                .config
+                .prerequisites
+                .get_mut(idx)
+                .map(|r| match &mut r.action {
+                    PrereqAction::RunBundledExe { args, .. } => args,
+                    PrereqAction::RunCommand { args, .. } => args,
+                    PrereqAction::PromptAndAbort { download_url, .. } => download_url,
+                }),
         }
     }
 
@@ -353,7 +602,7 @@ impl StudioWindowState {
     }
 
     fn nav_item_rect(idx: usize) -> RectF {
-        RectF::new(22.0, 90.0 + (idx as f32) * 50.0, 186.0, 42.0)
+        RectF::new(22.0, 88.0 + (idx as f32) * 44.0, 186.0, 38.0)
     }
 
     fn btn_generate_demo_rect(&self) -> RectF {
@@ -419,7 +668,7 @@ impl StudioWindowState {
         self.renderer.draw_text(
             hint,
             &self.renderer.font_caption,
-            RectF::new(card.x + 28.0, card.y + card.h - 50.0, 420.0, 38.0),
+            RectF::new(card.x + 28.0, card.y + card.h - 50.0, card.w - 236.0, 38.0),
             pal.text_muted,
             0,
             1,
@@ -475,7 +724,7 @@ impl StudioWindowState {
         self.renderer.draw_window_header(
             w,
             "Nyan Setup Studio",
-            "CRT-Static",
+            "",
             &pal,
             hover_theme,
             hover_min,
@@ -497,7 +746,8 @@ impl StudioWindowState {
             (StudioTab::Metadata, VectorIcon::Info, "1. 应用元数据"),
             (StudioTab::FilesAndPaths, VectorIcon::Folder, "2. 目录与路径"),
             (StudioTab::OptionsAndLicense, VectorIcon::Shield, "3. 选项与协议"),
-            (StudioTab::BuildAndTest, VectorIcon::Rocket, "4. 构建与测试"),
+            (StudioTab::Prerequisites, VectorIcon::Sparkles, "4. 环境检测"),
+            (StudioTab::BuildAndTest, VectorIcon::Rocket, "5. 构建与测试"),
         ];
 
         for (i, (tab, icon, title)) in tabs.iter().enumerate() {
@@ -506,10 +756,10 @@ impl StudioWindowState {
             let hovered = r.contains(mx, my);
 
             if selected {
-                self.renderer.fill_rounded_rect(r, 21.0, pal.primary);
+                self.renderer.fill_rounded_rect(r, 19.0, pal.primary);
             } else if hovered {
                 self.renderer
-                    .fill_rounded_rect(r, 21.0, rgba(0x6366F1, 0.12));
+                    .fill_rounded_rect(r, 19.0, rgba(0x6366F1, 0.12));
             }
             self.renderer.draw_ripples(&self.ripples, r);
 
@@ -530,7 +780,7 @@ impl StudioWindowState {
         }
 
         // Summary box inside left rail
-        let stat_card = RectF::new(22.0, 304.0, 186.0, 250.0);
+        let stat_card = RectF::new(22.0, 316.0, 186.0, 238.0);
         self.renderer.fill_rounded_rect(stat_card, 12.0, pal.surface);
         self.renderer
             .draw_rounded_rect(stat_card, 12.0, 1.0, pal.outline_subtle);
@@ -538,7 +788,7 @@ impl StudioWindowState {
         self.renderer.draw_text(
             "当前源目录统计",
             &self.renderer.font_caption,
-            RectF::new(36.0, 316.0, 158.0, 18.0),
+            RectF::new(36.0, 326.0, 158.0, 18.0),
             pal.text_secondary,
             0,
             1,
@@ -546,9 +796,9 @@ impl StudioWindowState {
         );
         self.renderer.draw_line(
             32.0,
-            340.0,
+            348.0,
             198.0,
-            340.0,
+            348.0,
             1.0,
             pal.outline_subtle,
         );
@@ -556,7 +806,7 @@ impl StudioWindowState {
         self.renderer.draw_text(
             &format!("{} 个文件", self.scanned_files.len()),
             &self.renderer.font_title_lg,
-            RectF::new(36.0, 350.0, 158.0, 28.0),
+            RectF::new(36.0, 356.0, 158.0, 28.0),
             pal.primary,
             0,
             1,
@@ -565,7 +815,7 @@ impl StudioWindowState {
         self.renderer.draw_text(
             &format!("未压缩体积: {}", format_bytes(self.scanned_total_bytes)),
             &self.renderer.font_body_bold,
-            RectF::new(36.0, 382.0, 158.0, 20.0),
+            RectF::new(36.0, 386.0, 158.0, 20.0),
             pal.text_primary,
             0,
             1,
@@ -574,12 +824,12 @@ impl StudioWindowState {
 
         let info_rows = [
             "渲染引擎: Direct2D 硬件加速",
-            "运行库: 静态链接 CRT (零依赖)",
+            "运行库: 静态链接 CRT",
             "压缩流: LZMA2 固实 + BCJ",
             "卸载器: 自动生成 unins000",
         ];
         for (idx, line) in info_rows.iter().enumerate() {
-            let ry = 418.0 + (idx as f32) * 26.0;
+            let ry = 420.0 + (idx as f32) * 25.0;
             self.renderer.fill_circle(38.0, ry + 9.0, 3.0, pal.success);
             self.renderer.draw_text(
                 line,
@@ -612,6 +862,7 @@ impl StudioWindowState {
             StudioTab::Metadata => self.draw_tab_metadata(card),
             StudioTab::FilesAndPaths => self.draw_tab_files(card),
             StudioTab::OptionsAndLicense => self.draw_tab_options(card),
+            StudioTab::Prerequisites => self.draw_tab_prerequisites(card),
             StudioTab::BuildAndTest => self.draw_tab_build(card),
         }
 
@@ -645,59 +896,64 @@ impl StudioWindowState {
 
         // Row 1 (y = card.y + 112.0)
         let r_name = RectF::new(x0, card.y + 112.0, w_half, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_name,
             "应用程序名称 (App Name)",
             &self.config.app_name,
             self.focused_field == FocusedField::AppName,
             r_name.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
 
         let r_ver = RectF::new(x0 + w_half + 20.0, card.y + 112.0, w_half, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_ver,
             "版本号 (App Version)",
             &self.config.app_version,
             self.focused_field == FocusedField::AppVersion,
             r_ver.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
 
         // Row 2 (y = card.y + 182.0)
         let r_pub = RectF::new(x0, card.y + 182.0, w_half, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_pub,
             "发布者 / 开发者名称 (Publisher)",
             &self.config.publisher,
             self.focused_field == FocusedField::Publisher,
             r_pub.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
 
         let r_id = RectF::new(x0 + w_half + 20.0, card.y + 182.0, w_half, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_id,
             "应用唯一标识符 (App ID / 注册表卸载键名)",
             &self.config.app_id,
             self.focused_field == FocusedField::AppId,
             r_id.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
 
         // Row 3 (y = card.y + 252.0): Main Exe (left) & Installer Icon (right)
         let r_exe = RectF::new(x0, card.y + 252.0, w_half - 100.0, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_exe,
             "主程序相对路径 (指向 .exe)",
             &self.config.main_exe,
             self.focused_field == FocusedField::MainExe,
             r_exe.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
 
@@ -714,13 +970,14 @@ impl StudioWindowState {
         );
 
         let r_ico = RectF::new(x0 + w_half + 20.0, card.y + 252.0, w_half - 100.0, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_ico,
-            "安装包图标 (可选 .ico，留空使用默认)",
+            "安装包图标 (可选 .ico，留空默认)",
             &self.installer_icon_input,
             self.focused_field == FocusedField::InstallerIcon,
             r_ico.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
 
@@ -811,7 +1068,7 @@ impl StudioWindowState {
 
         self.draw_card_footer(
             card,
-            "提示：点击任意输入框可直接打字编辑，支持 Ctrl+V 粘贴与 Tab 键切换",
+            "提示：支持鼠标拖拽选中、Ctrl+A 全选、Ctrl+C/X/V 复制粘贴与方向键移动光标",
             "下一步：目录与路径",
             None,
         );
@@ -832,13 +1089,14 @@ impl StudioWindowState {
 
         // 1. Source Directory (y = card.y + 112.0)
         let r_src = RectF::new(x0, card.y + 112.0, w_full - 138.0, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_src,
             "待打包的源文件夹路径 (Source Directory)",
             &self.source_dir,
             self.focused_field == FocusedField::SourceDir,
             r_src.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
         let btn_src = RectF::new(x0 + w_full - 126.0, card.y + 112.0, 126.0, 38.0);
@@ -855,13 +1113,14 @@ impl StudioWindowState {
 
         // 2. Default Target Install Directory (y = card.y + 180.0)
         let r_inst = RectF::new(x0, card.y + 180.0, w_full - 246.0, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_inst,
             "默认目标安装路径 (支持 %LOCALAPPDATA% 或 %PROGRAMFILES%)",
             &self.config.default_install_dir,
             self.focused_field == FocusedField::DefaultInstallDir,
             r_inst.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
         let btn_localappdata = RectF::new(x0 + w_full - 234.0, card.y + 180.0, 112.0, 38.0);
@@ -889,13 +1148,14 @@ impl StudioWindowState {
 
         // 3. Output Installer .exe path (y = card.y + 248.0)
         let r_out = RectF::new(x0, card.y + 248.0, w_full - 138.0, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_out,
             "生成的单文件安装包保存路径 (Output Setup .exe)",
             &self.output_exe,
             self.focused_field == FocusedField::OutputExe,
             r_out.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
         let btn_out = RectF::new(x0 + w_full - 126.0, card.y + 248.0, 126.0, 38.0);
@@ -1188,9 +1448,625 @@ impl StudioWindowState {
         self.draw_card_footer(
             card,
             "提示：用户安装软件时需勾选同意上述许可协议方可继续安装",
+            "下一步：环境检测",
+            None,
+        );
+    }
+
+    fn draw_tab_prerequisites(&self, card: RectF) {
+        let pal = self.palette;
+        let mx = self.mouse_x;
+        let my = self.mouse_y;
+        let x0 = card.x + 28.0;
+        let w_full = card.w - 56.0;
+
+        self.draw_card_header(
+            card,
+            "前置运行环境检测与自动部署 (Prerequisites)",
+            "配置安装时需校验的注册表键值或系统文件/PE版本，未满足时自动运行随包组件或自定义逻辑。",
+        );
+
+        // Top Preset Bar (y = card.y + 84.0, h = 34.0)
+        let presets = [
+            "+ VC++ 2015-2022 (x64)",
+            "+ VC++ 2015-2022 (x86)",
+            "+ 注册表检测规则",
+            "+ 文件/PE版本检测",
+        ];
+        let preset_w = (w_full - 30.0) / 4.0;
+        for (i, label) in presets.iter().enumerate() {
+            let pr = RectF::new(
+                x0 + (i as f32) * (preset_w + 10.0),
+                card.y + 84.0,
+                preset_w,
+                34.0,
+            );
+            self.renderer.draw_button(
+                pr,
+                label,
+                None,
+                ButtonVariant::Tonal,
+                pr.contains(mx, my),
+                true,
+                &pal,
+                &self.ripples,
+            );
+        }
+
+        // Left Rule List Box (x = x0, y = card.y + 128.0, w = 216.0, h = 368.0)
+        let list_w = 216.0;
+        let list_box = RectF::new(x0, card.y + 128.0, list_w, 368.0);
+        self.renderer
+            .fill_rounded_rect(list_box, 10.0, pal.surface_variant);
+        self.renderer
+            .draw_rounded_rect(list_box, 10.0, 1.0, pal.outline_subtle);
+
+        self.renderer.draw_text(
+            &format!("检测规则列表 ({})", self.config.prerequisites.len()),
+            &self.renderer.font_caption,
+            RectF::new(list_box.x + 12.0, list_box.y + 8.0, list_w - 24.0, 18.0),
+            pal.text_secondary,
+            0,
+            1,
+            false,
+        );
+
+        let max_rules_vis = 6usize;
+        for (idx, rule) in self
+            .config
+            .prerequisites
+            .iter()
+            .take(max_rules_vis)
+            .enumerate()
+        {
+            let item_r = RectF::new(
+                list_box.x + 8.0,
+                list_box.y + 32.0 + (idx as f32) * 46.0,
+                list_w - 16.0,
+                42.0,
+            );
+            let is_sel = idx == self.selected_prereq_idx;
+            let is_hov = item_r.contains(mx, my);
+            if is_sel {
+                self.renderer
+                    .fill_rounded_rect(item_r, 8.0, pal.primary_container);
+                self.renderer
+                    .draw_rounded_rect(item_r, 8.0, 1.2, pal.primary);
+            } else if is_hov {
+                self.renderer
+                    .fill_rounded_rect(item_r, 8.0, rgba(0x6366F1, 0.08));
+            }
+
+            // Checkbox indicator on left of item
+            let chk_box = RectF::new(item_r.x + 8.0, item_r.y + 12.0, 18.0, 18.0);
+            if rule.enabled {
+                self.renderer.fill_rounded_rect(chk_box, 4.0, pal.primary);
+                self.renderer.draw_icon(
+                    VectorIcon::Check,
+                    chk_box.x + 9.0,
+                    chk_box.y + 9.0,
+                    11.0,
+                    rgb(0xFFFFFF),
+                );
+            } else {
+                self.renderer
+                    .draw_rounded_rect(chk_box, 4.0, 1.2, pal.outline);
+            }
+
+            self.renderer.draw_text(
+                &rule.name,
+                &self.renderer.font_body_bold,
+                RectF::new(item_r.x + 30.0, item_r.y + 4.0, item_r.w - 34.0, 18.0),
+                if is_sel {
+                    pal.on_primary_container
+                } else {
+                    pal.text_primary
+                },
+                0,
+                1,
+                false,
+            );
+
+            let local_ok = evaluate_prereq_condition(&rule.condition, None);
+            let sub_tag = format!(
+                "{} · {}",
+                rule.condition.short_tag(),
+                if local_ok { "本机已满足" } else { "本机未满足" }
+            );
+            self.renderer.draw_text(
+                &sub_tag,
+                &self.renderer.font_caption,
+                RectF::new(item_r.x + 30.0, item_r.y + 22.0, item_r.w - 34.0, 16.0),
+                if local_ok { pal.success } else { pal.warning },
+                0,
+                1,
+                false,
+            );
+        }
+
+        let btn_del_rule = RectF::new(
+            list_box.x + 10.0,
+            list_box.y + list_box.h - 42.0,
+            list_w - 20.0,
+            32.0,
+        );
+        self.renderer.draw_button(
+            btn_del_rule,
+            "删除选中规则",
+            None,
+            ButtonVariant::Outlined,
+            btn_del_rule.contains(mx, my),
+            !self.config.prerequisites.is_empty(),
+            &pal,
+            &self.ripples,
+        );
+
+        // Right Rule Editor Panel (x = x0 + 230.0, y = card.y + 128.0, w = w_full - 230.0, h = 368.0)
+        let right_x = x0 + 230.0;
+        let right_w = w_full - 230.0;
+        let edit_box = RectF::new(right_x, card.y + 128.0, right_w, 368.0);
+        self.renderer
+            .fill_rounded_rect(edit_box, 10.0, pal.surface_variant);
+        self.renderer
+            .draw_rounded_rect(edit_box, 10.0, 1.0, pal.outline_subtle);
+
+        let Some(rule) = self.config.prerequisites.get(self.selected_prereq_idx) else {
+            self.renderer.draw_text(
+                "当前未配置任何前置环境检测规则。\n点击上方预设按钮可一键添加 VC++ 运行库、注册表键值或文件/PE版本检测。",
+                &self.renderer.font_body,
+                edit_box.inset(24.0, 120.0),
+                pal.text_muted,
+                1,
+                1,
+                true,
+            );
+            self.draw_card_footer(
+                card,
+                "提示：随包运行库仅在目标机器检测未通过时解压至 %TEMP% 执行并自动清理",
+                "下一步：构建安装包",
+                Some(VectorIcon::Rocket),
+            );
+            return;
+        };
+
+        let ex = edit_box.x + 16.0;
+        let ew = edit_box.w - 32.0;
+
+        // Row 1 (y = card.y + 152.0): Rule Name + Condition Kind Dropdown
+        let r_rname = RectF::new(ex, card.y + 152.0, ew - 178.0, 34.0);
+        self.renderer.draw_text_field_with_sel(
+            r_rname,
+            "规则名称 (安装进度展示)",
+            &rule.name,
+            self.focused_field == FocusedField::PrereqName,
+            r_rname.contains(mx, my),
+            self.caret_visible,
+            &self.text_input,
+            &pal,
+        );
+        let dd_cond_kind = RectF::new(ex + ew - 168.0, card.y + 152.0, 168.0, 34.0);
+        let cond_kind_label = match rule.condition {
+            PrereqCondition::Registry { .. } => "注册表键值检测",
+            PrereqCondition::File { .. } => "文件 / PE版本",
+        };
+        self.renderer.draw_dropdown(
+            dd_cond_kind,
+            "检测条件类型",
+            cond_kind_label,
+            self.open_dropdown == Some(PrereqDropdown::ConditionKind),
+            dd_cond_kind.contains(mx, my),
+            &pal,
+        );
+
+        // Row 2 & Row 3: Condition Details
+        match &rule.condition {
+            PrereqCondition::Registry {
+                root,
+                subkey,
+                value_name,
+                arch_view,
+                operator,
+                expected,
+            } => {
+                // Row 2 (y = card.y + 210.0): Hive Dropdown + Arch Dropdown + Key Path
+                let dd_hive = RectF::new(ex, card.y + 210.0, 86.0, 34.0);
+                self.renderer.draw_dropdown(
+                    dd_hive,
+                    "注册表根键",
+                    root.label(),
+                    self.open_dropdown == Some(PrereqDropdown::RegHive),
+                    dd_hive.contains(mx, my),
+                    &pal,
+                );
+                let dd_arch = RectF::new(ex + 94.0, card.y + 210.0, 102.0, 34.0);
+                self.renderer.draw_dropdown(
+                    dd_arch,
+                    "注册表视图",
+                    arch_view.label(),
+                    self.open_dropdown == Some(PrereqDropdown::RegArch),
+                    dd_arch.contains(mx, my),
+                    &pal,
+                );
+                let r_kpath = RectF::new(ex + 204.0, card.y + 210.0, ew - 204.0, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_kpath,
+                    "注册表子键路径 (Subkey)",
+                    subkey,
+                    self.focused_field == FocusedField::PrereqTarget,
+                    r_kpath.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+
+                // Row 3 (y = card.y + 268.0): Value Name + Operator Dropdown + Expected Value
+                let r_vname = RectF::new(ex, card.y + 268.0, 130.0, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_vname,
+                    "值名称 (空=仅测键)",
+                    value_name,
+                    self.focused_field == FocusedField::PrereqValueName,
+                    r_vname.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+                let dd_op = RectF::new(ex + 138.0, card.y + 268.0, 122.0, 34.0);
+                self.renderer.draw_dropdown(
+                    dd_op,
+                    "比较条件",
+                    operator.label(),
+                    self.open_dropdown == Some(PrereqDropdown::Operator),
+                    dd_op.contains(mx, my),
+                    &pal,
+                );
+                let r_exp = RectF::new(ex + 268.0, card.y + 268.0, ew - 268.0, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_exp,
+                    "期望值 / 版本",
+                    expected,
+                    self.focused_field == FocusedField::PrereqExpected,
+                    r_exp.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+            }
+            PrereqCondition::File {
+                path,
+                operator,
+                expected_version,
+            } => {
+                // Row 2 (y = card.y + 210.0): File Path
+                let r_fpath = RectF::new(ex, card.y + 210.0, ew, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_fpath,
+                    "目标文件路径 (支持 %SystemRoot% / %PROGRAMFILES% / %INSTALL_DIR%)",
+                    path,
+                    self.focused_field == FocusedField::PrereqTarget,
+                    r_fpath.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+
+                // Row 3 (y = card.y + 268.0): Operator Dropdown + Expected Version
+                let dd_op = RectF::new(ex, card.y + 268.0, 146.0, 34.0);
+                let file_op_label = match operator {
+                    CheckOperator::Exists => "文件存在",
+                    CheckOperator::GreaterOrEqual => "PE版本 >=",
+                    CheckOperator::Equals => "PE版本 ==",
+                    CheckOperator::NotExists => "文件不存在",
+                    other => other.label(),
+                };
+                self.renderer.draw_dropdown(
+                    dd_op,
+                    "检测方式",
+                    file_op_label,
+                    self.open_dropdown == Some(PrereqDropdown::Operator),
+                    dd_op.contains(mx, my),
+                    &pal,
+                );
+                let r_exp = RectF::new(ex + 156.0, card.y + 268.0, ew - 156.0, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_exp,
+                    "期望 PE 版本号 (如 14.38.0.0，仅测存在留空)",
+                    expected_version,
+                    self.focused_field == FocusedField::PrereqExpected,
+                    r_exp.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+            }
+        }
+
+        // Row 4 (y = card.y + 328.0): Action Type Dropdown
+        let dd_act_kind = RectF::new(ex, card.y + 328.0, ew, 34.0);
+        let cur_act_label = match rule.action {
+            PrereqAction::RunBundledExe { .. } => {
+                "1. 随包打包并运行安装器 (解压至 %TEMP% 执行并自动清理)"
+            }
+            PrereqAction::RunCommand { .. } => {
+                "2. 执行系统命令或脚本 (支持 cmd / powershell / %INSTALL_DIR%)"
+            }
+            PrereqAction::PromptAndAbort { .. } => {
+                "3. 弹窗提示用户并中止安装 (可选引导打开下载链接)"
+            }
+        };
+        self.renderer.draw_dropdown(
+            dd_act_kind,
+            "检测未通过时的执行动作",
+            cur_act_label,
+            self.open_dropdown == Some(PrereqDropdown::ActionKind),
+            dd_act_kind.contains(mx, my),
+            &pal,
+        );
+
+        // Row 5 (y = card.y + 388.0) & Row 6 (y = card.y + 448.0): Action Fields
+        match &rule.action {
+            PrereqAction::RunBundledExe {
+                source_file,
+                args,
+                elevate,
+                ..
+            } => {
+                let r_act1 = RectF::new(ex, card.y + 388.0, ew - 96.0, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_act1,
+                    "随包打包的安装器路径 (如 vc_redist.x64.exe)",
+                    source_file,
+                    self.focused_field == FocusedField::PrereqActionPrimary,
+                    r_act1.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+                let btn_pick_redist = RectF::new(ex + ew - 88.0, card.y + 388.0, 88.0, 34.0);
+                self.renderer.draw_button(
+                    btn_pick_redist,
+                    "选择exe",
+                    Some(VectorIcon::Folder),
+                    ButtonVariant::Outlined,
+                    btn_pick_redist.contains(mx, my),
+                    true,
+                    &pal,
+                    &self.ripples,
+                );
+
+                let r_act2 = RectF::new(ex, card.y + 448.0, ew - 134.0, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_act2,
+                    "静默安装参数 (如 /install /quiet /norestart)",
+                    args,
+                    self.focused_field == FocusedField::PrereqActionSecondary,
+                    r_act2.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+                let dd_elev = RectF::new(ex + ew - 126.0, card.y + 448.0, 126.0, 34.0);
+                self.renderer.draw_dropdown(
+                    dd_elev,
+                    "权限模式",
+                    if *elevate {
+                        "UAC 提权运行"
+                    } else {
+                        "普通权限运行"
+                    },
+                    self.open_dropdown == Some(PrereqDropdown::ElevateMode),
+                    dd_elev.contains(mx, my),
+                    &pal,
+                );
+            }
+            PrereqAction::RunCommand {
+                program,
+                args,
+                elevate,
+                ..
+            } => {
+                let r_act1 = RectF::new(ex, card.y + 388.0, ew, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_act1,
+                    "执行程序路径 (支持 cmd / powershell / %INSTALL_DIR%)",
+                    program,
+                    self.focused_field == FocusedField::PrereqActionPrimary,
+                    r_act1.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+
+                let r_act2 = RectF::new(ex, card.y + 448.0, ew - 134.0, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_act2,
+                    "命令行参数 (Arguments)",
+                    args,
+                    self.focused_field == FocusedField::PrereqActionSecondary,
+                    r_act2.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+                let dd_elev = RectF::new(ex + ew - 126.0, card.y + 448.0, 126.0, 34.0);
+                self.renderer.draw_dropdown(
+                    dd_elev,
+                    "权限模式",
+                    if *elevate {
+                        "UAC 提权运行"
+                    } else {
+                        "普通权限运行"
+                    },
+                    self.open_dropdown == Some(PrereqDropdown::ElevateMode),
+                    dd_elev.contains(mx, my),
+                    &pal,
+                );
+            }
+            PrereqAction::PromptAndAbort {
+                message,
+                download_url,
+            } => {
+                let r_act1 = RectF::new(ex, card.y + 388.0, ew, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_act1,
+                    "检测未通过时的弹窗警告文本 (Message)",
+                    message,
+                    self.focused_field == FocusedField::PrereqActionPrimary,
+                    r_act1.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+                let r_act2 = RectF::new(ex, card.y + 448.0, ew, 34.0);
+                self.renderer.draw_text_field_with_sel(
+                    r_act2,
+                    "引导用户打开的下载链接 URL (可选，留空仅提示)",
+                    download_url,
+                    self.focused_field == FocusedField::PrereqActionSecondary,
+                    r_act2.contains(mx, my),
+                    self.caret_visible,
+                    &self.text_input,
+                    &pal,
+                );
+            }
+        }
+
+        self.draw_card_footer(
+            card,
+            "提示：随包运行库仅在目标机器检测未通过时解压至 %TEMP% 执行并自动清理",
             "下一步：构建安装包",
             Some(VectorIcon::Rocket),
         );
+
+        // Render active floating dropdown menu overlay on top of everything
+        if let Some(open_dd) = self.open_dropdown {
+            self.draw_prereq_dropdown_overlay(open_dd, rule, ex, ew, card.y);
+        }
+    }
+
+    fn draw_prereq_dropdown_overlay(
+        &self,
+        open_dd: PrereqDropdown,
+        rule: &PrerequisiteRule,
+        ex: f32,
+        ew: f32,
+        card_y: f32,
+    ) {
+        let mx = self.mouse_x;
+        let my = self.mouse_y;
+        let w = self.width_dip;
+        let h = self.height_dip;
+        let pal = self.palette;
+
+        match open_dd {
+            PrereqDropdown::ConditionKind => {
+                let trig = RectF::new(ex + ew - 168.0, card_y + 152.0, 168.0, 34.0);
+                let items = ["注册表键值检测", "文件 / PE版本"];
+                let sel = match rule.condition {
+                    PrereqCondition::Registry { .. } => 0,
+                    PrereqCondition::File { .. } => 1,
+                };
+                self.renderer
+                    .draw_dropdown_menu(trig, &items, sel, mx, my, w, h, &pal);
+            }
+            PrereqDropdown::RegHive => {
+                if let PrereqCondition::Registry { root, .. } = &rule.condition {
+                    let trig = RectF::new(ex, card_y + 210.0, 86.0, 34.0);
+                    let items = [
+                        "HKLM (本机系统)",
+                        "HKCU (当前用户)",
+                        "HKCR (类与关联)",
+                        "HKU (所有用户)",
+                    ];
+                    let sel = match root {
+                        RegHiveRoot::Hklm => 0,
+                        RegHiveRoot::Hkcu => 1,
+                        RegHiveRoot::Hkcr => 2,
+                        RegHiveRoot::Hku => 3,
+                    };
+                    self.renderer
+                        .draw_dropdown_menu(trig, &items, sel, mx, my, w, h, &pal);
+                }
+            }
+            PrereqDropdown::RegArch => {
+                if let PrereqCondition::Registry { arch_view, .. } = &rule.condition {
+                    let trig = RectF::new(ex + 94.0, card_y + 210.0, 102.0, 34.0);
+                    let items = ["默认视图", "64位视图 (x64)", "32位视图 (x86)"];
+                    let sel = match arch_view {
+                        RegArchView::Default => 0,
+                        RegArchView::X64 => 1,
+                        RegArchView::X86 => 2,
+                    };
+                    self.renderer
+                        .draw_dropdown_menu(trig, &items, sel, mx, my, w, h, &pal);
+                }
+            }
+            PrereqDropdown::Operator => match &rule.condition {
+                PrereqCondition::Registry { operator, .. } => {
+                    let trig = RectF::new(ex + 138.0, card_y + 268.0, 122.0, 34.0);
+                    let items = [
+                        "存在",
+                        "版本/数值 >=",
+                        "等于 (==)",
+                        "包含文本",
+                        "不等于 (!=)",
+                        "不存在",
+                    ];
+                    let sel = match operator {
+                        CheckOperator::Exists => 0,
+                        CheckOperator::GreaterOrEqual => 1,
+                        CheckOperator::Equals => 2,
+                        CheckOperator::Contains => 3,
+                        CheckOperator::NotEquals => 4,
+                        CheckOperator::NotExists => 5,
+                    };
+                    self.renderer
+                        .draw_dropdown_menu(trig, &items, sel, mx, my, w, h, &pal);
+                }
+                PrereqCondition::File { operator, .. } => {
+                    let trig = RectF::new(ex, card_y + 268.0, 146.0, 34.0);
+                    let items = ["文件存在", "PE版本 >=", "PE版本 ==", "文件不存在"];
+                    let sel = match operator {
+                        CheckOperator::Exists => 0,
+                        CheckOperator::GreaterOrEqual => 1,
+                        CheckOperator::Equals => 2,
+                        CheckOperator::NotExists => 3,
+                        _ => 1,
+                    };
+                    self.renderer
+                        .draw_dropdown_menu(trig, &items, sel, mx, my, w, h, &pal);
+                }
+            },
+            PrereqDropdown::ActionKind => {
+                let trig = RectF::new(ex, card_y + 328.0, ew, 34.0);
+                let items = [
+                    "1. 随包打包并运行安装器 (解压至 %TEMP% 执行并自动清理)",
+                    "2. 执行系统命令或安装目录脚本 (支持 cmd / powershell / %INSTALL_DIR%)",
+                    "3. 弹窗提示用户并中止安装 (可选引导打开下载链接)",
+                ];
+                let sel = match rule.action {
+                    PrereqAction::RunBundledExe { .. } => 0,
+                    PrereqAction::RunCommand { .. } => 1,
+                    PrereqAction::PromptAndAbort { .. } => 2,
+                };
+                self.renderer
+                    .draw_dropdown_menu(trig, &items, sel, mx, my, w, h, &pal);
+            }
+            PrereqDropdown::ElevateMode => {
+                let cur_elev = match &rule.action {
+                    PrereqAction::RunBundledExe { elevate, .. }
+                    | PrereqAction::RunCommand { elevate, .. } => Some(*elevate),
+                    PrereqAction::PromptAndAbort { .. } => None,
+                };
+                if let Some(elevate) = cur_elev {
+                    let trig = RectF::new(ex + ew - 126.0, card_y + 448.0, 126.0, 34.0);
+                    let items = ["UAC 提权运行 (管理员)", "普通权限运行 (当前用户)"];
+                    let sel = if elevate { 0 } else { 1 };
+                    self.renderer
+                        .draw_dropdown_menu(trig, &items, sel, mx, my, w, h, &pal);
+                }
+            }
+        }
     }
 
     fn draw_tab_build(&self, card: RectF) {
@@ -1368,9 +2244,219 @@ impl StudioWindowState {
         );
     }
 
+    fn try_click_prereq_dropdown_menu(
+        &mut self,
+        open_dd: PrereqDropdown,
+        x: f32,
+        y: f32,
+    ) -> bool {
+        let card = self.content_card_rect();
+        let x0 = card.x + 28.0;
+        let w_full = card.w - 56.0;
+        let right_x = x0 + 230.0;
+        let right_w = w_full - 230.0;
+        let ex = right_x + 16.0;
+        let ew = right_w - 32.0;
+        let w = self.width_dip;
+        let h = self.height_dip;
+
+        let Some(rule_ref) = self.config.prerequisites.get(self.selected_prereq_idx) else {
+            return false;
+        };
+
+        let (trig, items_vec): (RectF, Vec<&str>) = match open_dd {
+            PrereqDropdown::ConditionKind => (
+                RectF::new(ex + ew - 168.0, card.y + 152.0, 168.0, 34.0),
+                vec!["注册表键值检测", "文件 / PE版本"],
+            ),
+            PrereqDropdown::RegHive => (
+                RectF::new(ex, card.y + 210.0, 86.0, 34.0),
+                vec![
+                    "HKLM (本机系统)",
+                    "HKCU (当前用户)",
+                    "HKCR (类与关联)",
+                    "HKU (所有用户)",
+                ],
+            ),
+            PrereqDropdown::RegArch => (
+                RectF::new(ex + 94.0, card.y + 210.0, 102.0, 34.0),
+                vec!["默认视图", "64位视图 (x64)", "32位视图 (x86)"],
+            ),
+            PrereqDropdown::Operator => match &rule_ref.condition {
+                PrereqCondition::Registry { .. } => (
+                    RectF::new(ex + 138.0, card.y + 268.0, 122.0, 34.0),
+                    vec![
+                        "存在",
+                        "版本/数值 >=",
+                        "等于 (==)",
+                        "包含文本",
+                        "不等于 (!=)",
+                        "不存在",
+                    ],
+                ),
+                PrereqCondition::File { .. } => (
+                    RectF::new(ex, card.y + 268.0, 146.0, 34.0),
+                    vec!["文件存在", "PE版本 >=", "PE版本 ==", "文件不存在"],
+                ),
+            },
+            PrereqDropdown::ActionKind => (
+                RectF::new(ex, card.y + 328.0, ew, 34.0),
+                vec![
+                    "1. 随包打包并运行安装器 (解压至 %TEMP% 执行并自动清理)",
+                    "2. 执行系统命令或安装目录脚本 (支持 cmd / powershell / %INSTALL_DIR%)",
+                    "3. 弹窗提示用户并中止安装 (可选引导打开下载链接)",
+                ],
+            ),
+            PrereqDropdown::ElevateMode => (
+                RectF::new(ex + ew - 126.0, card.y + 448.0, 126.0, 34.0),
+                vec!["UAC 提权运行 (管理员)", "普通权限运行 (当前用户)"],
+            ),
+        };
+
+        // Clicking trigger again toggles closed
+        if trig.contains(x, y) {
+            return true;
+        }
+
+        let menu_rect = self.renderer.dropdown_menu_rect(trig, &items_vec, w, h);
+        if !menu_rect.contains(x, y) {
+            return false;
+        }
+
+        let item_h = 32.0;
+        let rel_y = (y - (menu_rect.y + 4.0)).max(0.0);
+        let picked_idx = (rel_y / item_h).floor() as usize;
+        if picked_idx >= items_vec.len() {
+            return true;
+        }
+
+        if let Some(rule) = self.config.prerequisites.get_mut(self.selected_prereq_idx) {
+            match open_dd {
+                PrereqDropdown::ConditionKind => {
+                    if picked_idx == 0 && matches!(rule.condition, PrereqCondition::File { .. }) {
+                        rule.condition = PrereqCondition::Registry {
+                            root: RegHiveRoot::Hklm,
+                            subkey: "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64"
+                                .to_string(),
+                            value_name: "Installed".to_string(),
+                            arch_view: RegArchView::X64,
+                            operator: CheckOperator::GreaterOrEqual,
+                            expected: "1".to_string(),
+                        };
+                    } else if picked_idx == 1
+                        && matches!(rule.condition, PrereqCondition::Registry { .. })
+                    {
+                        rule.condition = PrereqCondition::File {
+                            path: "%SystemRoot%\\System32\\vcruntime140.dll".to_string(),
+                            operator: CheckOperator::GreaterOrEqual,
+                            expected_version: "14.38.0.0".to_string(),
+                        };
+                    }
+                }
+                PrereqDropdown::RegHive => {
+                    if let PrereqCondition::Registry { root, .. } = &mut rule.condition {
+                        *root = match picked_idx {
+                            0 => RegHiveRoot::Hklm,
+                            1 => RegHiveRoot::Hkcu,
+                            2 => RegHiveRoot::Hkcr,
+                            _ => RegHiveRoot::Hku,
+                        };
+                    }
+                }
+                PrereqDropdown::RegArch => {
+                    if let PrereqCondition::Registry { arch_view, .. } = &mut rule.condition {
+                        *arch_view = match picked_idx {
+                            0 => RegArchView::Default,
+                            1 => RegArchView::X64,
+                            _ => RegArchView::X86,
+                        };
+                    }
+                }
+                PrereqDropdown::Operator => match &mut rule.condition {
+                    PrereqCondition::Registry { operator, .. } => {
+                        *operator = match picked_idx {
+                            0 => CheckOperator::Exists,
+                            1 => CheckOperator::GreaterOrEqual,
+                            2 => CheckOperator::Equals,
+                            3 => CheckOperator::Contains,
+                            4 => CheckOperator::NotEquals,
+                            _ => CheckOperator::NotExists,
+                        };
+                    }
+                    PrereqCondition::File { operator, .. } => {
+                        *operator = match picked_idx {
+                            0 => CheckOperator::Exists,
+                            1 => CheckOperator::GreaterOrEqual,
+                            2 => CheckOperator::Equals,
+                            _ => CheckOperator::NotExists,
+                        };
+                    }
+                },
+                PrereqDropdown::ActionKind => {
+                    let cur_kind = match rule.action {
+                        PrereqAction::RunBundledExe { .. } => 0,
+                        PrereqAction::RunCommand { .. } => 1,
+                        PrereqAction::PromptAndAbort { .. } => 2,
+                    };
+                    if picked_idx != cur_kind {
+                        rule.action = match picked_idx {
+                            0 => PrereqAction::RunBundledExe {
+                                source_file: "vc_redist.x64.exe".to_string(),
+                                bundled_rel_path: String::new(),
+                                args: "/install /quiet /norestart".to_string(),
+                                elevate: true,
+                                wait: true,
+                                success_exit_codes: vec![0, 1638, 3010],
+                            },
+                            1 => PrereqAction::RunCommand {
+                                program: "cmd.exe".to_string(),
+                                args: "/C echo Configuring prerequisite...".to_string(),
+                                elevate: false,
+                                wait: true,
+                                success_exit_codes: vec![0],
+                            },
+                            _ => PrereqAction::PromptAndAbort {
+                                message: "检测到系统缺少必要的运行库组件，请先安装该运行库后再运行本安装程序。"
+                                    .to_string(),
+                                download_url:
+                                    "https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist"
+                                        .to_string(),
+                            },
+                        };
+                    }
+                }
+                PrereqDropdown::ElevateMode => match &mut rule.action {
+                    PrereqAction::RunBundledExe { elevate, .. }
+                    | PrereqAction::RunCommand { elevate, .. } => {
+                        *elevate = picked_idx == 0;
+                    }
+                    PrereqAction::PromptAndAbort { .. } => {}
+                },
+            }
+        }
+        true
+    }
+
     pub fn on_lbutton_down(&mut self, x: f32, y: f32) {
         let w = self.width_dip;
         let card = self.content_card_rect();
+        self.text_input.is_dragging = false;
+
+        // 0. If a dropdown menu is currently open in Prerequisites tab, handle its clicks first
+        if self.active_tab == StudioTab::Prerequisites {
+            if let Some(open_dd) = self.open_dropdown {
+                if self.try_click_prereq_dropdown_menu(open_dd, x, y) {
+                    self.open_dropdown = None;
+                    self.invalidate();
+                    return;
+                }
+                self.open_dropdown = None;
+            }
+        } else {
+            self.open_dropdown = None;
+        }
+
+        let prev_focus = self.focused_field;
         self.focused_field = FocusedField::None;
 
         // 1. Header buttons
@@ -1414,6 +2500,7 @@ impl StudioWindowState {
             StudioTab::Metadata,
             StudioTab::FilesAndPaths,
             StudioTab::OptionsAndLicense,
+            StudioTab::Prerequisites,
             StudioTab::BuildAndTest,
         ];
         for (i, tab) in tabs.iter().enumerate() {
@@ -1465,17 +2552,23 @@ impl StudioWindowState {
                 let btn_pick_ico = RectF::new(x0 + w_full - 92.0, card.y + 252.0, 92.0, 38.0);
 
                 if r_name.contains(x, y) {
-                    self.focused_field = FocusedField::AppName;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::AppName, r_name, x);
                 } else if r_ver.contains(x, y) {
-                    self.focused_field = FocusedField::AppVersion;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::AppVersion, r_ver, x);
                 } else if r_pub.contains(x, y) {
-                    self.focused_field = FocusedField::Publisher;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::Publisher, r_pub, x);
                 } else if r_id.contains(x, y) {
-                    self.focused_field = FocusedField::AppId;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::AppId, r_id, x);
                 } else if r_exe.contains(x, y) {
-                    self.focused_field = FocusedField::MainExe;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::MainExe, r_exe, x);
                 } else if r_ico.contains(x, y) {
-                    self.focused_field = FocusedField::InstallerIcon;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::InstallerIcon, r_ico, x);
                 } else if btn_pick_exe.contains(x, y) {
                     if let Some(picked) = pick_open_file_dialog(
                         self.hwnd,
@@ -1516,7 +2609,8 @@ impl StudioWindowState {
                 let btn_out = RectF::new(x0 + w_full - 126.0, card.y + 248.0, 126.0, 38.0);
 
                 if r_src.contains(x, y) {
-                    self.focused_field = FocusedField::SourceDir;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::SourceDir, r_src, x);
                 } else if btn_src.contains(x, y) {
                     if let Some(folder) = pick_folder_dialog(
                         self.hwnd,
@@ -1527,7 +2621,8 @@ impl StudioWindowState {
                         self.rescan_source_dir();
                     }
                 } else if r_inst.contains(x, y) {
-                    self.focused_field = FocusedField::DefaultInstallDir;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::DefaultInstallDir, r_inst, x);
                 } else if btn_localappdata.contains(x, y) {
                     self.config.default_install_dir =
                         format!("%LOCALAPPDATA%\\Programs\\{}", self.config.app_name);
@@ -1535,7 +2630,8 @@ impl StudioWindowState {
                     self.config.default_install_dir =
                         format!("%PROGRAMFILES%\\{}", self.config.app_name);
                 } else if r_out.contains(x, y) {
-                    self.focused_field = FocusedField::OutputExe;
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::OutputExe, r_out, x);
                 } else if btn_out.contains(x, y) {
                     let def_name = format!("{}_Setup.exe", self.config.app_name.replace(' ', ""));
                     if let Some(save_path) =
@@ -1608,8 +2704,248 @@ impl StudioWindowState {
                         }
                     }
                 } else if btn_next.contains(x, y) {
+                    self.active_tab = StudioTab::Prerequisites;
+                }
+            }
+            StudioTab::Prerequisites => {
+                // 1. Top Preset Bar (y = card.y + 84.0, h = 34.0)
+                let preset_w = (w_full - 30.0) / 4.0;
+                for i in 0..4usize {
+                    let pr = RectF::new(
+                        x0 + (i as f32) * (preset_w + 10.0),
+                        card.y + 84.0,
+                        preset_w,
+                        34.0,
+                    );
+                    if pr.contains(x, y) {
+                        let new_rule = match i {
+                            0 => PrerequisiteRule::preset_vc_redist_x64(),
+                            1 => PrerequisiteRule::preset_vc_redist_x86(),
+                            2 => PrerequisiteRule::preset_custom_registry(),
+                            _ => PrerequisiteRule::preset_custom_file_version(),
+                        };
+                        self.config.prerequisites.push(new_rule);
+                        self.selected_prereq_idx =
+                            self.config.prerequisites.len().saturating_sub(1);
+                        self.add_ripple(x, y, pr, rgba(0x6366F1, 0.25));
+                        self.invalidate();
+                        return;
+                    }
+                }
+
+                // 2. Left Rule List & Delete button
+                let list_w = 216.0;
+                let list_box = RectF::new(x0, card.y + 128.0, list_w, 368.0);
+                for idx in 0..self.config.prerequisites.len().min(6) {
+                    let item_r = RectF::new(
+                        list_box.x + 8.0,
+                        list_box.y + 32.0 + (idx as f32) * 46.0,
+                        list_w - 16.0,
+                        42.0,
+                    );
+                    if item_r.contains(x, y) {
+                        let chk_area = RectF::new(item_r.x, item_r.y, 32.0, item_r.h);
+                        if chk_area.contains(x, y) {
+                            if let Some(r) = self.config.prerequisites.get_mut(idx) {
+                                r.enabled = !r.enabled;
+                            }
+                        }
+                        self.selected_prereq_idx = idx;
+                        self.invalidate();
+                        return;
+                    }
+                }
+
+                let btn_del_rule = RectF::new(
+                    list_box.x + 10.0,
+                    list_box.y + list_box.h - 42.0,
+                    list_w - 20.0,
+                    32.0,
+                );
+                if btn_del_rule.contains(x, y) && !self.config.prerequisites.is_empty() {
+                    let rem_idx = self
+                        .selected_prereq_idx
+                        .min(self.config.prerequisites.len() - 1);
+                    self.config.prerequisites.remove(rem_idx);
+                    if self.selected_prereq_idx >= self.config.prerequisites.len()
+                        && !self.config.prerequisites.is_empty()
+                    {
+                        self.selected_prereq_idx = self.config.prerequisites.len() - 1;
+                    }
+                    self.invalidate();
+                    return;
+                }
+
+                if btn_next.contains(x, y) {
                     self.active_tab = StudioTab::BuildAndTest;
                     self.rescan_source_dir();
+                    self.invalidate();
+                    return;
+                }
+
+                // 3. Right Rule Editor Controls
+                let right_x = x0 + 230.0;
+                let right_w = w_full - 230.0;
+                let ex = right_x + 16.0;
+                let ew = right_w - 32.0;
+
+                let has_rule = self.config.prerequisites.get(self.selected_prereq_idx).is_some();
+                if has_rule {
+                    let r_rname = RectF::new(ex, card.y + 152.0, ew - 178.0, 34.0);
+                    let dd_cond_kind = RectF::new(ex + ew - 168.0, card.y + 152.0, 168.0, 34.0);
+                    let dd_act_kind = RectF::new(ex, card.y + 328.0, ew, 34.0);
+
+                    if r_rname.contains(x, y) {
+                        self.focused_field = prev_focus;
+                        self.click_text_field(FocusedField::PrereqName, r_rname, x);
+                    } else if dd_cond_kind.contains(x, y) {
+                        self.open_dropdown = Some(PrereqDropdown::ConditionKind);
+                    } else if dd_act_kind.contains(x, y) {
+                        self.open_dropdown = Some(PrereqDropdown::ActionKind);
+                    } else {
+                        let is_reg = matches!(
+                            self.config.prerequisites[self.selected_prereq_idx].condition,
+                            PrereqCondition::Registry { .. }
+                        );
+                        if is_reg {
+                            let dd_hive = RectF::new(ex, card.y + 210.0, 86.0, 34.0);
+                            let dd_arch = RectF::new(ex + 94.0, card.y + 210.0, 102.0, 34.0);
+                            let r_kpath = RectF::new(ex + 204.0, card.y + 210.0, ew - 204.0, 34.0);
+                            let r_vname = RectF::new(ex, card.y + 268.0, 130.0, 34.0);
+                            let dd_op = RectF::new(ex + 138.0, card.y + 268.0, 122.0, 34.0);
+                            let r_exp = RectF::new(ex + 268.0, card.y + 268.0, ew - 268.0, 34.0);
+
+                            if dd_hive.contains(x, y) {
+                                self.open_dropdown = Some(PrereqDropdown::RegHive);
+                            } else if dd_arch.contains(x, y) {
+                                self.open_dropdown = Some(PrereqDropdown::RegArch);
+                            } else if r_kpath.contains(x, y) {
+                                self.focused_field = prev_focus;
+                                self.click_text_field(FocusedField::PrereqTarget, r_kpath, x);
+                            } else if r_vname.contains(x, y) {
+                                self.focused_field = prev_focus;
+                                self.click_text_field(FocusedField::PrereqValueName, r_vname, x);
+                            } else if dd_op.contains(x, y) {
+                                self.open_dropdown = Some(PrereqDropdown::Operator);
+                            } else if r_exp.contains(x, y) {
+                                self.focused_field = prev_focus;
+                                self.click_text_field(FocusedField::PrereqExpected, r_exp, x);
+                            }
+                        } else {
+                            let r_fpath = RectF::new(ex, card.y + 210.0, ew, 34.0);
+                            let dd_op = RectF::new(ex, card.y + 268.0, 146.0, 34.0);
+                            let r_exp = RectF::new(ex + 156.0, card.y + 268.0, ew - 156.0, 34.0);
+
+                            if r_fpath.contains(x, y) {
+                                self.focused_field = prev_focus;
+                                self.click_text_field(FocusedField::PrereqTarget, r_fpath, x);
+                            } else if dd_op.contains(x, y) {
+                                self.open_dropdown = Some(PrereqDropdown::Operator);
+                            } else if r_exp.contains(x, y) {
+                                self.focused_field = prev_focus;
+                                self.click_text_field(FocusedField::PrereqExpected, r_exp, x);
+                            }
+                        }
+
+                        // Row 5 & Row 6: Action Fields
+                        let act_kind = match self.config.prerequisites[self.selected_prereq_idx].action {
+                            PrereqAction::RunBundledExe { .. } => 0,
+                            PrereqAction::RunCommand { .. } => 1,
+                            PrereqAction::PromptAndAbort { .. } => 2,
+                        };
+                        match act_kind {
+                            0 => {
+                                let r_act1 = RectF::new(ex, card.y + 388.0, ew - 96.0, 34.0);
+                                let btn_pick_redist =
+                                    RectF::new(ex + ew - 88.0, card.y + 388.0, 88.0, 34.0);
+                                let r_act2 = RectF::new(ex, card.y + 448.0, ew - 134.0, 34.0);
+                                let dd_elev =
+                                    RectF::new(ex + ew - 126.0, card.y + 448.0, 126.0, 34.0);
+
+                                if r_act1.contains(x, y) {
+                                    self.focused_field = prev_focus;
+                                    self.click_text_field(
+                                        FocusedField::PrereqActionPrimary,
+                                        r_act1,
+                                        x,
+                                    );
+                                } else if btn_pick_redist.contains(x, y) {
+                                    if let Some(picked) = pick_open_file_dialog(
+                                        self.hwnd,
+                                        "选择随包打包的前置组件安装程序 (.exe)",
+                                        "可执行安装程序 (*.exe)",
+                                        "*.exe",
+                                    ) {
+                                        if let Some(rule) = self
+                                            .config
+                                            .prerequisites
+                                            .get_mut(self.selected_prereq_idx)
+                                        {
+                                            if let PrereqAction::RunBundledExe {
+                                                source_file, ..
+                                            } = &mut rule.action
+                                            {
+                                                *source_file =
+                                                    picked.to_string_lossy().to_string();
+                                            }
+                                        }
+                                    }
+                                } else if r_act2.contains(x, y) {
+                                    self.focused_field = prev_focus;
+                                    self.click_text_field(
+                                        FocusedField::PrereqActionSecondary,
+                                        r_act2,
+                                        x,
+                                    );
+                                } else if dd_elev.contains(x, y) {
+                                    self.open_dropdown = Some(PrereqDropdown::ElevateMode);
+                                }
+                            }
+                            1 => {
+                                let r_act1 = RectF::new(ex, card.y + 388.0, ew, 34.0);
+                                let r_act2 = RectF::new(ex, card.y + 448.0, ew - 134.0, 34.0);
+                                let dd_elev =
+                                    RectF::new(ex + ew - 126.0, card.y + 448.0, 126.0, 34.0);
+
+                                if r_act1.contains(x, y) {
+                                    self.focused_field = prev_focus;
+                                    self.click_text_field(
+                                        FocusedField::PrereqActionPrimary,
+                                        r_act1,
+                                        x,
+                                    );
+                                } else if r_act2.contains(x, y) {
+                                    self.focused_field = prev_focus;
+                                    self.click_text_field(
+                                        FocusedField::PrereqActionSecondary,
+                                        r_act2,
+                                        x,
+                                    );
+                                } else if dd_elev.contains(x, y) {
+                                    self.open_dropdown = Some(PrereqDropdown::ElevateMode);
+                                }
+                            }
+                            _ => {
+                                let r_act1 = RectF::new(ex, card.y + 388.0, ew, 34.0);
+                                let r_act2 = RectF::new(ex, card.y + 448.0, ew, 34.0);
+                                if r_act1.contains(x, y) {
+                                    self.focused_field = prev_focus;
+                                    self.click_text_field(
+                                        FocusedField::PrereqActionPrimary,
+                                        r_act1,
+                                        x,
+                                    );
+                                } else if r_act2.contains(x, y) {
+                                    self.focused_field = prev_focus;
+                                    self.click_text_field(
+                                        FocusedField::PrereqActionSecondary,
+                                        r_act2,
+                                        x,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             StudioTab::BuildAndTest => {
@@ -1639,13 +2975,40 @@ impl StudioWindowState {
         self.invalidate();
     }
 
+    pub fn on_mouse_move(&mut self, mx: f32, my: f32, lbutton_down: bool) {
+        self.mouse_x = mx;
+        self.mouse_y = my;
+        if !lbutton_down {
+            self.text_input.is_dragging = false;
+        } else if self.text_input.is_dragging && self.focused_field != FocusedField::None {
+            if let Some(rect) = self.field_rect(self.focused_field) {
+                let val = self
+                    .field_value_ref(self.focused_field)
+                    .unwrap_or("")
+                    .to_string();
+                let char_idx = self.renderer.hit_test_text_field_char(
+                    rect,
+                    &val,
+                    mx,
+                    self.text_input.caret_pos,
+                );
+                self.text_input.set_caret(&val, char_idx, true);
+                self.caret_visible = true;
+            }
+        }
+        self.invalidate();
+    }
+
     pub fn on_char(&mut self, ch: char) {
         if ch.is_control() {
             return;
         }
         let is_src = self.focused_field == FocusedField::SourceDir;
+        let mut ti = self.text_input;
         if let Some(field) = self.active_field_mut() {
-            field.push(ch);
+            ti.insert_char(field, ch);
+            self.text_input = ti;
+            self.caret_visible = true;
             if is_src {
                 self.rescan_source_dir();
             }
@@ -1655,35 +3018,142 @@ impl StudioWindowState {
 
     pub fn on_keydown(&mut self, vk: u16) {
         let ctrl_down = unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
+        let shift_down = unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 };
 
-        if ctrl_down && vk == b'V' as u16 {
-            if let Some(clip) = get_clipboard_text(self.hwnd) {
-                let clean: String = clip.lines().next().unwrap_or("").trim().to_string();
-                let is_src = self.focused_field == FocusedField::SourceDir;
-                if let Some(field) = self.active_field_mut() {
-                    field.push_str(&clean);
-                    if is_src {
-                        self.rescan_source_dir();
-                    }
-                    self.invalidate();
-                }
+        if vk == VK_ESCAPE.0 {
+            if self.open_dropdown.is_some() {
+                self.open_dropdown = None;
+            } else {
+                self.focused_field = FocusedField::None;
+                self.text_input.is_dragging = false;
             }
+            self.invalidate();
             return;
         }
 
+        if self.focused_field == FocusedField::None {
+            return;
+        }
+
+        if ctrl_down {
+            match vk {
+                x if x == b'A' as u16 => {
+                    if let Some(val) = self.field_value_ref(self.focused_field).map(str::to_string)
+                    {
+                        self.text_input.select_all(&val);
+                        self.caret_visible = true;
+                        self.invalidate();
+                    }
+                    return;
+                }
+                x if x == b'C' as u16 => {
+                    if let Some(val) = self.field_value_ref(self.focused_field) {
+                        if let Some(sel) = self.text_input.selected_text(val) {
+                            set_clipboard_text(self.hwnd, sel);
+                        }
+                    }
+                    return;
+                }
+                x if x == b'X' as u16 => {
+                    if self.text_input.has_selection() {
+                        if let Some(val) = self.field_value_ref(self.focused_field) {
+                            if let Some(sel) = self.text_input.selected_text(val) {
+                                set_clipboard_text(self.hwnd, sel);
+                            }
+                        }
+                        let is_src = self.focused_field == FocusedField::SourceDir;
+                        let mut ti = self.text_input;
+                        if let Some(field) = self.active_field_mut() {
+                            ti.delete_selection(field);
+                            self.text_input = ti;
+                            self.caret_visible = true;
+                            if is_src {
+                                self.rescan_source_dir();
+                            }
+                            self.invalidate();
+                        }
+                    }
+                    return;
+                }
+                x if x == b'V' as u16 => {
+                    if let Some(clip) = get_clipboard_text(self.hwnd) {
+                        let clean: String = clip.lines().next().unwrap_or("").trim().to_string();
+                        let is_src = self.focused_field == FocusedField::SourceDir;
+                        let mut ti = self.text_input;
+                        if let Some(field) = self.active_field_mut() {
+                            ti.insert_str(field, &clean);
+                            self.text_input = ti;
+                            self.caret_visible = true;
+                            if is_src {
+                                self.rescan_source_dir();
+                            }
+                            self.invalidate();
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match vk {
+            x if x == VK_LEFT.0 => {
+                if let Some(val) = self.field_value_ref(self.focused_field).map(str::to_string) {
+                    self.text_input.move_left(&val, shift_down);
+                    self.caret_visible = true;
+                    self.invalidate();
+                }
+            }
+            x if x == VK_RIGHT.0 => {
+                if let Some(val) = self.field_value_ref(self.focused_field).map(str::to_string) {
+                    self.text_input.move_right(&val, shift_down);
+                    self.caret_visible = true;
+                    self.invalidate();
+                }
+            }
+            x if x == VK_HOME.0 => {
+                if let Some(val) = self.field_value_ref(self.focused_field).map(str::to_string) {
+                    self.text_input.move_home(&val, shift_down);
+                    self.caret_visible = true;
+                    self.invalidate();
+                }
+            }
+            x if x == VK_END.0 => {
+                if let Some(val) = self.field_value_ref(self.focused_field).map(str::to_string) {
+                    self.text_input.move_end(&val, shift_down);
+                    self.caret_visible = true;
+                    self.invalidate();
+                }
+            }
             x if x == VK_BACK.0 => {
                 let is_src = self.focused_field == FocusedField::SourceDir;
+                let mut ti = self.text_input;
                 if let Some(field) = self.active_field_mut() {
-                    field.pop();
+                    ti.backspace(field);
+                    self.text_input = ti;
+                    self.caret_visible = true;
                     if is_src {
                         self.rescan_source_dir();
                     }
                     self.invalidate();
                 }
             }
-            x if x == VK_ESCAPE.0 || x == VK_RETURN.0 => {
+            x if x == VK_DELETE.0 => {
+                let is_src = self.focused_field == FocusedField::SourceDir;
+                let mut ti = self.text_input;
+                if let Some(field) = self.active_field_mut() {
+                    ti.delete_forward(field);
+                    self.text_input = ti;
+                    self.caret_visible = true;
+                    if is_src {
+                        self.rescan_source_dir();
+                    }
+                    self.invalidate();
+                }
+            }
+            x if x == VK_RETURN.0 => {
                 self.focused_field = FocusedField::None;
+                self.text_input.is_dragging = false;
                 self.invalidate();
             }
             x if x == VK_TAB.0 => {
@@ -1697,8 +3167,24 @@ impl StudioWindowState {
                     FocusedField::SourceDir => FocusedField::DefaultInstallDir,
                     FocusedField::DefaultInstallDir => FocusedField::OutputExe,
                     FocusedField::OutputExe => FocusedField::SourceDir,
+                    FocusedField::PrereqName => FocusedField::PrereqTarget,
+                    FocusedField::PrereqTarget => {
+                        if self.field_rect(FocusedField::PrereqValueName).is_some() {
+                            FocusedField::PrereqValueName
+                        } else {
+                            FocusedField::PrereqExpected
+                        }
+                    }
+                    FocusedField::PrereqValueName => FocusedField::PrereqExpected,
+                    FocusedField::PrereqExpected => FocusedField::PrereqActionPrimary,
+                    FocusedField::PrereqActionPrimary => FocusedField::PrereqActionSecondary,
+                    FocusedField::PrereqActionSecondary => FocusedField::PrereqName,
                     FocusedField::None => FocusedField::None,
                 };
+                if let Some(val) = self.field_value_ref(self.focused_field).map(str::to_string) {
+                    self.text_input.select_all(&val);
+                }
+                self.caret_visible = true;
                 self.invalidate();
             }
             _ => {}
@@ -1882,14 +3368,17 @@ unsafe extern "system" fn studio_wnd_proc(
         }
         WM_MOUSEMOVE => {
             let (mx, my) = map_mouse(state, lparam);
-            state.mouse_x = mx;
-            state.mouse_y = my;
-            state.invalidate();
+            let lbutton_down = (wparam.0 & 0x0001) != 0;
+            state.on_mouse_move(mx, my, lbutton_down);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let (mx, my) = map_mouse(state, lparam);
             state.on_lbutton_down(mx, my);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            state.text_input.is_dragging = false;
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {

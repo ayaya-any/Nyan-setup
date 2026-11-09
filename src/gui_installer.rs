@@ -1,6 +1,6 @@
 use crate::d2d::{
-    rgb, rgba, ButtonVariant, D2DRenderer, MaterialPalette, RectF, RippleEffect, ThemeMode,
-    VectorIcon,
+    rgb, rgba, ButtonVariant, D2DRenderer, MaterialPalette, RectF, RippleEffect, TextInputState,
+    ThemeMode, VectorIcon,
 };
 use crate::package::{
     extract_package_files, format_bytes, InstallProgressEvent, PackageManifest, UninstallReceipt,
@@ -9,7 +9,7 @@ use crate::win32_ops::{
     create_shell_shortcut, detect_existing_installation, execute_uninstall_steps,
     expand_install_path, find_running_target_processes, get_clipboard_text, get_known_folder_path,
     pick_folder_dialog, query_disk_space, register_uninstall_entry, schedule_self_delete,
-    shell_open, to_wide, write_uninstaller_files, ExistingInstallInfo,
+    set_clipboard_text, shell_open, to_wide, write_uninstaller_files, ExistingInstallInfo,
 };
 use std::env;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,8 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTS
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_RETURN,
+    GetKeyState, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE,
+    VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
@@ -33,9 +34,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
     CREATESTRUCTW, CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCAPTION, IDC_ARROW,
     ICON_BIG, ICON_SMALL, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WM_CHAR,
-    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETICON, WM_SIZE, WM_TIMER, WM_USER, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETICON, WM_SIZE,
+    WM_TIMER, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 
 const WM_APP_INSTALL_EVENT: u32 = WM_USER + 202;
@@ -82,6 +83,7 @@ pub struct InstallerWindowState {
     pub license_scroll_line: usize,
     pub install_dir_input: String,
     pub path_focused: bool,
+    pub text_input: TextInputState,
     pub caret_visible: bool,
     pub opt_desktop_shortcut: bool,
     pub opt_start_menu_shortcut: bool,
@@ -161,6 +163,7 @@ impl InstallerWindowState {
             license_scroll_line: 0,
             install_dir_input: install_dir_str,
             path_focused: false,
+            text_input: TextInputState::new(),
             caret_visible: true,
             opt_desktop_shortcut: opt_desk,
             opt_start_menu_shortcut: opt_menu,
@@ -204,6 +207,7 @@ impl InstallerWindowState {
             license_scroll_line: 0,
             install_dir_input: String::new(),
             path_focused: false,
+            text_input: TextInputState::new(),
             caret_visible: false,
             opt_desktop_shortcut: false,
             opt_start_menu_shortcut: false,
@@ -445,13 +449,19 @@ impl InstallerWindowState {
                     bytes_total,
                 } => {
                     let ratio = (bytes_done as f32) / (bytes_total.max(1) as f32);
-                    self.target_progress = 0.08 + ratio * 0.76;
+                    self.target_progress = 0.08 + ratio * 0.72;
                     self.status_text = format!(
                         "正在释放文件 ({}/{}): {}",
                         current_index, total_files, relative_path
                     );
                     self.logs
                         .push(format!("  [CRC32 OK] 释放: {}", relative_path));
+                }
+                InstallProgressEvent::RunningPrerequisite(name) => {
+                    self.target_progress = 0.84;
+                    self.status_text = format!("正在检测并配置前置运行环境: {} ...", name);
+                    self.logs
+                        .push(format!("  [环境组件] 正在执行前置环境动作: {}", name));
                 }
                 InstallProgressEvent::CreatingShortcuts => {
                     self.target_progress = 0.88;
@@ -533,7 +543,7 @@ impl InstallerWindowState {
                 let badge = if is_update {
                     "覆盖更新模式"
                 } else {
-                    "CRT-Static"
+                    ""
                 };
                 self.renderer.draw_window_header(
                     w,
@@ -896,13 +906,14 @@ impl InstallerWindowState {
 
         // Target path field + Browse button (y = card.y + 66.0)
         let r_path = RectF::new(x0, card.y + 66.0, w_full - 134.0, 38.0);
-        self.renderer.draw_text_field(
+        self.renderer.draw_text_field_with_sel(
             r_path,
             "目标安装文件夹路径 (Installation Directory)",
             &self.install_dir_input,
             self.path_focused,
             r_path.contains(mx, my),
             self.caret_visible,
+            &self.text_input,
             &pal,
         );
 
@@ -1460,7 +1471,9 @@ impl InstallerWindowState {
     pub fn on_lbutton_down(&mut self, x: f32, y: f32) {
         let w = self.width_dip;
         let h = self.height_dip;
+        let prev_focused = self.path_focused;
         self.path_focused = false;
+        self.text_input.is_dragging = false;
 
         if D2DRenderer::header_theme_rect(w).contains(x, y) {
             self.palette = match self.palette.mode {
@@ -1581,7 +1594,29 @@ impl InstallerWindowState {
                 let btn_install = RectF::new(card.x + card.w - 184.0, btn_y, 158.0, 38.0);
 
                 if r_path.contains(x, y) {
+                    let shift_down =
+                        unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 };
+                    let cur_caret = if prev_focused {
+                        self.text_input.caret_pos
+                    } else {
+                        0
+                    };
+                    let char_idx = self.renderer.hit_test_text_field_char(
+                        r_path,
+                        &self.install_dir_input,
+                        x,
+                        cur_caret,
+                    );
                     self.path_focused = true;
+                    if prev_focused && shift_down {
+                        self.text_input
+                            .set_caret(&self.install_dir_input, char_idx, true);
+                    } else {
+                        self.text_input
+                            .set_caret(&self.install_dir_input, char_idx, false);
+                    }
+                    self.text_input.is_dragging = true;
+                    self.caret_visible = true;
                 } else if btn_browse.contains(x, y) {
                     if let Some(picked) = pick_folder_dialog(
                         self.hwnd,
@@ -1663,11 +1698,38 @@ impl InstallerWindowState {
         self.invalidate();
     }
 
+    pub fn on_mouse_move(&mut self, mx: f32, my: f32, lbutton_down: bool) {
+        self.mouse_x = mx;
+        self.mouse_y = my;
+        if !lbutton_down {
+            self.text_input.is_dragging = false;
+        } else if self.text_input.is_dragging
+            && self.path_focused
+            && self.step == WizardStep::CustomOptions
+        {
+            let card = self.installer_card_rect();
+            let x0 = card.x + 26.0;
+            let w_full = card.w - 52.0;
+            let r_path = RectF::new(x0, card.y + 66.0, w_full - 134.0, 38.0);
+            let char_idx = self.renderer.hit_test_text_field_char(
+                r_path,
+                &self.install_dir_input,
+                mx,
+                self.text_input.caret_pos,
+            );
+            self.text_input
+                .set_caret(&self.install_dir_input, char_idx, true);
+            self.caret_visible = true;
+        }
+        self.invalidate();
+    }
+
     pub fn on_char(&mut self, ch: char) {
         if ch.is_control() || !self.path_focused {
             return;
         }
-        self.install_dir_input.push(ch);
+        self.text_input.insert_char(&mut self.install_dir_input, ch);
+        self.caret_visible = true;
         self.refresh_disk_space();
         self.invalidate();
     }
@@ -1677,22 +1739,93 @@ impl InstallerWindowState {
             return;
         }
         let ctrl_down = unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
-        if ctrl_down && vk == b'V' as u16 {
-            if let Some(clip) = get_clipboard_text(self.hwnd) {
-                let line = clip.lines().next().unwrap_or("").trim();
-                self.install_dir_input.push_str(line);
+        let shift_down = unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 };
+
+        if ctrl_down {
+            match vk {
+                x if x == b'A' as u16 => {
+                    self.text_input.select_all(&self.install_dir_input);
+                    self.caret_visible = true;
+                    self.invalidate();
+                    return;
+                }
+                x if x == b'C' as u16 => {
+                    if let Some(sel) = self.text_input.selected_text(&self.install_dir_input) {
+                        set_clipboard_text(self.hwnd, sel);
+                    }
+                    return;
+                }
+                x if x == b'X' as u16 => {
+                    if self.text_input.has_selection() {
+                        if let Some(sel) = self.text_input.selected_text(&self.install_dir_input) {
+                            set_clipboard_text(self.hwnd, sel);
+                        }
+                        self.text_input
+                            .delete_selection(&mut self.install_dir_input);
+                        self.caret_visible = true;
+                        self.refresh_disk_space();
+                        self.invalidate();
+                    }
+                    return;
+                }
+                x if x == b'V' as u16 => {
+                    if let Some(clip) = get_clipboard_text(self.hwnd) {
+                        let line = clip.lines().next().unwrap_or("").trim();
+                        self.text_input
+                            .insert_str(&mut self.install_dir_input, line);
+                        self.caret_visible = true;
+                        self.refresh_disk_space();
+                        self.invalidate();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match vk {
+            x if x == VK_LEFT.0 => {
+                self.text_input
+                    .move_left(&self.install_dir_input, shift_down);
+                self.caret_visible = true;
+                self.invalidate();
+            }
+            x if x == VK_RIGHT.0 => {
+                self.text_input
+                    .move_right(&self.install_dir_input, shift_down);
+                self.caret_visible = true;
+                self.invalidate();
+            }
+            x if x == VK_HOME.0 => {
+                self.text_input
+                    .move_home(&self.install_dir_input, shift_down);
+                self.caret_visible = true;
+                self.invalidate();
+            }
+            x if x == VK_END.0 => {
+                self.text_input
+                    .move_end(&self.install_dir_input, shift_down);
+                self.caret_visible = true;
+                self.invalidate();
+            }
+            x if x == VK_BACK.0 => {
+                self.text_input.backspace(&mut self.install_dir_input);
+                self.caret_visible = true;
                 self.refresh_disk_space();
                 self.invalidate();
             }
-            return;
-        }
-        if vk == VK_BACK.0 {
-            self.install_dir_input.pop();
-            self.refresh_disk_space();
-            self.invalidate();
-        } else if vk == VK_ESCAPE.0 || vk == VK_RETURN.0 {
-            self.path_focused = false;
-            self.invalidate();
+            x if x == VK_DELETE.0 => {
+                self.text_input.delete_forward(&mut self.install_dir_input);
+                self.caret_visible = true;
+                self.refresh_disk_space();
+                self.invalidate();
+            }
+            x if x == VK_ESCAPE.0 || x == VK_RETURN.0 => {
+                self.path_focused = false;
+                self.text_input.is_dragging = false;
+                self.invalidate();
+            }
+            _ => {}
         }
     }
 
@@ -1877,14 +2010,17 @@ unsafe extern "system" fn installer_wnd_proc(
         }
         WM_MOUSEMOVE => {
             let (mx, my) = map_mouse(state, lparam);
-            state.mouse_x = mx;
-            state.mouse_y = my;
-            state.invalidate();
+            let lbutton_down = (wparam.0 & 0x0001) != 0;
+            state.on_mouse_move(mx, my, lbutton_down);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let (mx, my) = map_mouse(state, lparam);
             state.on_lbutton_down(mx, my);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            state.text_input.is_dragging = false;
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {

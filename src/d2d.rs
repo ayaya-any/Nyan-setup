@@ -1,33 +1,36 @@
 use crate::icon;
 use crate::win32_ops::to_wide;
+use material_icons::{icon_to_char, Icon as MaterialIcon, FONT as MATERIAL_ICONS_FONT};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use windows::core::PCWSTR;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F,
     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
-    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U,
+    D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+    D2D_SIZE_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_LINE_JOIN_ROUND,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry,
+    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_LINE_JOIN_ROUND, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFactory5, IDWriteFontCollection,
+    IDWriteInMemoryFontFileLoader, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
     DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_TRIMMING_GRANULARITY_NONE, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_NONE,
+    DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -205,6 +208,182 @@ impl RippleEffect {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextInputState {
+    pub caret_pos: usize,
+    pub sel_anchor: usize,
+    pub is_dragging: bool,
+}
+
+impl TextInputState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn char_len(text: &str) -> usize {
+        text.chars().count()
+    }
+
+    pub fn byte_index_of_char(text: &str, char_idx: usize) -> usize {
+        text.char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(text.len())
+    }
+
+    pub fn clamp(&mut self, text: &str) {
+        let len = Self::char_len(text);
+        self.caret_pos = self.caret_pos.min(len);
+        self.sel_anchor = self.sel_anchor.min(len);
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.caret_pos != self.sel_anchor
+    }
+
+    pub fn selection_range(&self, text: &str) -> (usize, usize) {
+        let len = Self::char_len(text);
+        let s0 = self.caret_pos.min(self.sel_anchor).min(len);
+        let s1 = self.caret_pos.max(self.sel_anchor).min(len);
+        (s0, s1)
+    }
+
+    pub fn selected_text<'a>(&self, text: &'a str) -> Option<&'a str> {
+        let (s0, s1) = self.selection_range(text);
+        if s0 == s1 {
+            return None;
+        }
+        let b0 = Self::byte_index_of_char(text, s0);
+        let b1 = Self::byte_index_of_char(text, s1);
+        Some(&text[b0..b1])
+    }
+
+    pub fn select_all(&mut self, text: &str) {
+        self.sel_anchor = 0;
+        self.caret_pos = Self::char_len(text);
+    }
+
+    pub fn move_to_end(&mut self, text: &str) {
+        let len = Self::char_len(text);
+        self.caret_pos = len;
+        self.sel_anchor = len;
+    }
+
+    pub fn set_caret(&mut self, text: &str, pos: usize, extend_selection: bool) {
+        let clamped = pos.min(Self::char_len(text));
+        self.caret_pos = clamped;
+        if !extend_selection {
+            self.sel_anchor = clamped;
+        }
+    }
+
+    pub fn delete_selection(&mut self, text: &mut String) -> bool {
+        let (s0, s1) = self.selection_range(text);
+        if s0 == s1 {
+            return false;
+        }
+        let b0 = Self::byte_index_of_char(text, s0);
+        let b1 = Self::byte_index_of_char(text, s1);
+        text.replace_range(b0..b1, "");
+        self.caret_pos = s0;
+        self.sel_anchor = s0;
+        true
+    }
+
+    pub fn insert_str(&mut self, text: &mut String, s: &str) {
+        self.clamp(text);
+        self.delete_selection(text);
+        let b = Self::byte_index_of_char(text, self.caret_pos);
+        text.insert_str(b, s);
+        let added = s.chars().count();
+        self.caret_pos += added;
+        self.sel_anchor = self.caret_pos;
+    }
+
+    pub fn insert_char(&mut self, text: &mut String, ch: char) {
+        let mut buf = [0u8; 4];
+        self.insert_str(text, ch.encode_utf8(&mut buf));
+    }
+
+    pub fn backspace(&mut self, text: &mut String) -> bool {
+        self.clamp(text);
+        if self.delete_selection(text) {
+            return true;
+        }
+        if self.caret_pos > 0 {
+            let b_prev = Self::byte_index_of_char(text, self.caret_pos - 1);
+            let b_cur = Self::byte_index_of_char(text, self.caret_pos);
+            text.replace_range(b_prev..b_cur, "");
+            self.caret_pos -= 1;
+            self.sel_anchor = self.caret_pos;
+            return true;
+        }
+        false
+    }
+
+    pub fn delete_forward(&mut self, text: &mut String) -> bool {
+        self.clamp(text);
+        if self.delete_selection(text) {
+            return true;
+        }
+        let len = Self::char_len(text);
+        if self.caret_pos < len {
+            let b_cur = Self::byte_index_of_char(text, self.caret_pos);
+            let b_next = Self::byte_index_of_char(text, self.caret_pos + 1);
+            text.replace_range(b_cur..b_next, "");
+            self.sel_anchor = self.caret_pos;
+            return true;
+        }
+        false
+    }
+
+    pub fn move_left(&mut self, text: &str, shift: bool) {
+        self.clamp(text);
+        if shift {
+            self.caret_pos = self.caret_pos.saturating_sub(1);
+        } else if self.has_selection() {
+            let (s0, _) = self.selection_range(text);
+            self.caret_pos = s0;
+            self.sel_anchor = s0;
+        } else {
+            self.caret_pos = self.caret_pos.saturating_sub(1);
+            self.sel_anchor = self.caret_pos;
+        }
+    }
+
+    pub fn move_right(&mut self, text: &str, shift: bool) {
+        self.clamp(text);
+        let len = Self::char_len(text);
+        if shift {
+            self.caret_pos = (self.caret_pos + 1).min(len);
+        } else if self.has_selection() {
+            let (_, s1) = self.selection_range(text);
+            self.caret_pos = s1;
+            self.sel_anchor = s1;
+        } else {
+            self.caret_pos = (self.caret_pos + 1).min(len);
+            self.sel_anchor = self.caret_pos;
+        }
+    }
+
+    pub fn move_home(&mut self, text: &str, shift: bool) {
+        self.clamp(text);
+        self.caret_pos = 0;
+        if !shift {
+            self.sel_anchor = 0;
+        }
+    }
+
+    pub fn move_end(&mut self, text: &str, shift: bool) {
+        self.clamp(text);
+        let len = Self::char_len(text);
+        self.caret_pos = len;
+        if !shift {
+            self.sel_anchor = len;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorIcon {
     Info,
@@ -221,6 +400,368 @@ pub enum VectorIcon {
     Close,
     Sparkles,
     Play,
+    ChevronDown,
+    ChevronUp,
+}
+
+impl VectorIcon {
+    /// Convert to strongly-typed `material_icons::Icon` from the `material-icons` crate.
+    pub const fn to_material_icon(self) -> MaterialIcon {
+        match self {
+            Self::Check => MaterialIcon::Check,
+            Self::Folder => MaterialIcon::FolderOpen,
+            Self::Document => MaterialIcon::Description,
+            Self::Info => MaterialIcon::Info,
+            Self::Rocket => MaterialIcon::RocketLaunch,
+            Self::Shield => MaterialIcon::VerifiedUser,
+            Self::HardDrive => MaterialIcon::Storage,
+            Self::Trash => MaterialIcon::Delete,
+            Self::Sun => MaterialIcon::LightMode,
+            Self::Moon => MaterialIcon::DarkMode,
+            Self::Minimize => MaterialIcon::Remove,
+            Self::Close => MaterialIcon::Close,
+            Self::Sparkles => MaterialIcon::AutoAwesome,
+            Self::Play => MaterialIcon::PlayArrow,
+            Self::ChevronDown => MaterialIcon::ExpandMore,
+            Self::ChevronUp => MaterialIcon::ExpandLess,
+        }
+    }
+
+    /// Return the Unicode glyph `char` in `MaterialIcons-Regular.ttf` via `material_icons::icon_to_char`.
+    pub fn material_char(self) -> char {
+        icon_to_char(self.to_material_icon())
+    }
+
+    /// Official Google Material Icons (`MaterialIcons`, 24x24 viewBox) icon identifier.
+    pub const fn material_name(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::Folder => "folder_open",
+            Self::Document => "description",
+            Self::Info => "info",
+            Self::Rocket => "rocket_launch",
+            Self::Shield => "verified_user",
+            Self::HardDrive => "storage",
+            Self::Trash => "delete",
+            Self::Sun => "light_mode",
+            Self::Moon => "dark_mode",
+            Self::Minimize => "remove",
+            Self::Close => "close",
+            Self::Sparkles => "auto_awesome",
+            Self::Play => "play_arrow",
+            Self::ChevronDown => "expand_more",
+            Self::ChevronUp => "expand_less",
+        }
+    }
+
+    /// Official Google Material Icons (`MaterialIcons`, 24x24 viewBox) SVG `<path d="..."/>` definition.
+    pub const fn material_svg_path(self) -> &'static str {
+        match self {
+            Self::Check => "M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z",
+            Self::Folder => "M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z",
+            Self::Document => "M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z",
+            Self::Info => "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z",
+            Self::Rocket => "M9.19 6.35c-2.04 2.29-3.44 5.58-3.57 5.89L2 10.69l4.05-4.05c.47-.47 1.15-.68 1.81-.55l1.33.26zM11.17 17s3.74-1.55 5.89-3.7c5.4-5.4 4.5-9.62 4.21-10.57-.95-.3-5.17-1.19-10.57 4.21C8.55 9.09 7 12.83 7 12.83L11.17 17zm6.48-2.19c-2.29 2.04-5.58 3.44-5.89 3.57L13.31 22l4.05-4.05c.47-.47.68-1.15.55-1.81l-.26-1.33zM9 18c0 .83-.34 1.58-.88 2.12C6.94 21.3 2 22 2 22s.7-4.94 1.88-6.12C4.42 15.34 5.17 15 6 15c1.66 0 3 1.34 3 3zm4-9c0-1.1.9-2 2-2s2 .9 2 2-.9 2-2 2-2-.9-2-2z",
+            Self::Shield => "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z",
+            Self::HardDrive => "M2 20h20v-4H2v4zm2-3h2v2H4v-2zM2 4v4h20V4H2zm4 3H4V5h2v2zm-4 7h20v-4H2v4zm2-3h2v2H4v-2z",
+            Self::Trash => "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z",
+            Self::Sun => "M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0s.39-1.03 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.03 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06zM7.05 18.36c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06z",
+            Self::Moon => "M12 3c-4.97 0-9 4.03-9 9s4.03 9 9 9 9-4.03 9-9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z",
+            Self::Minimize => "M19 13H5v-2h14v2z",
+            Self::Close => "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
+            Self::Sparkles => "M19 9l1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5zM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25L19 15z",
+            Self::Play => "M8 5v14l11-7z",
+            Self::ChevronDown => "M16.59 8.59L12 13.17 7.41 8.59 6 10l6 6 6-6z",
+            Self::ChevronUp => "M12 8l-6 6 1.41 1.41L12 10.83l4.59 4.58L18 14z",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SvgToken {
+    Cmd(char),
+    Num(f32),
+}
+
+fn tokenize_svg_path(d: &str) -> Vec<SvgToken> {
+    let mut tokens = Vec::with_capacity(64);
+    let bytes = d.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || b == b',' {
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_alphabetic() {
+            tokens.push(SvgToken::Cmd(b as char));
+            i += 1;
+            continue;
+        }
+        if b == b'+' || b == b'-' || b == b'.' || b.is_ascii_digit() {
+            let start = i;
+            let mut has_dot = b == b'.';
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                if c.is_ascii_digit() {
+                    i += 1;
+                } else if c == b'.' && !has_dot {
+                    has_dot = true;
+                    i += 1;
+                } else if (c == b'e' || c == b'E') && i + 1 < len {
+                    i += 1;
+                    if bytes[i] == b'+' || bytes[i] == b'-' {
+                        i += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
+                if let Ok(val) = s.parse::<f32>() {
+                    tokens.push(SvgToken::Num(val));
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+pub fn build_material_icon_geometry(
+    factory: &ID2D1Factory,
+    d: &str,
+    cx: f32,
+    cy: f32,
+    size: f32,
+) -> Result<ID2D1PathGeometry, String> {
+    let tokens = tokenize_svg_path(d);
+    let scale = (size * 1.18) / 24.0;
+    let ox = cx - 12.0 * scale;
+    let oy = cy - 12.0 * scale;
+    let pt = |x: f32, y: f32| D2D_POINT_2F {
+        x: ox + x * scale,
+        y: oy + y * scale,
+    };
+
+    unsafe {
+        let path = factory
+            .CreatePathGeometry()
+            .map_err(|e| format!("CreatePathGeometry 失败: {}", e))?;
+        let sink = path.Open().map_err(|e| format!("Path.Open 失败: {}", e))?;
+        sink.SetFillMode(D2D1_FILL_MODE_WINDING);
+
+        let mut idx = 0usize;
+        let mut cur_x = 0.0f32;
+        let mut cur_y = 0.0f32;
+        let mut start_x = 0.0f32;
+        let mut start_y = 0.0f32;
+        let mut last_ctrl_x = 0.0f32;
+        let mut last_ctrl_y = 0.0f32;
+        let mut last_cmd = ' ';
+        let mut cur_cmd = ' ';
+        let mut in_figure = false;
+
+        let next_num = |idx: &mut usize| -> Option<f32> {
+            if let Some(SvgToken::Num(v)) = tokens.get(*idx) {
+                *idx += 1;
+                Some(*v)
+            } else {
+                None
+            }
+        };
+
+        while idx < tokens.len() {
+            if let SvgToken::Cmd(c) = tokens[idx] {
+                cur_cmd = c;
+                idx += 1;
+                if cur_cmd == 'Z' || cur_cmd == 'z' {
+                    if in_figure {
+                        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                        in_figure = false;
+                    }
+                    cur_x = start_x;
+                    cur_y = start_y;
+                    last_ctrl_x = cur_x;
+                    last_ctrl_y = cur_y;
+                    last_cmd = cur_cmd;
+                    continue;
+                }
+            }
+
+            match cur_cmd {
+                'M' | 'm' => {
+                    let Some(x) = next_num(&mut idx) else { break };
+                    let Some(y) = next_num(&mut idx) else { break };
+                    if in_figure {
+                        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                    }
+                    if cur_cmd == 'm' {
+                        cur_x += x;
+                        cur_y += y;
+                    } else {
+                        cur_x = x;
+                        cur_y = y;
+                    }
+                    start_x = cur_x;
+                    start_y = cur_y;
+                    sink.BeginFigure(pt(cur_x, cur_y), D2D1_FIGURE_BEGIN_FILLED);
+                    in_figure = true;
+                    last_ctrl_x = cur_x;
+                    last_ctrl_y = cur_y;
+                    last_cmd = cur_cmd;
+                    cur_cmd = if cur_cmd == 'm' { 'l' } else { 'L' };
+                }
+                'L' | 'l' => {
+                    let Some(x) = next_num(&mut idx) else { break };
+                    let Some(y) = next_num(&mut idx) else { break };
+                    if cur_cmd == 'l' {
+                        cur_x += x;
+                        cur_y += y;
+                    } else {
+                        cur_x = x;
+                        cur_y = y;
+                    }
+                    if in_figure {
+                        sink.AddLine(pt(cur_x, cur_y));
+                    }
+                    last_ctrl_x = cur_x;
+                    last_ctrl_y = cur_y;
+                    last_cmd = cur_cmd;
+                }
+                'H' | 'h' => {
+                    let Some(x) = next_num(&mut idx) else { break };
+                    if cur_cmd == 'h' {
+                        cur_x += x;
+                    } else {
+                        cur_x = x;
+                    }
+                    if in_figure {
+                        sink.AddLine(pt(cur_x, cur_y));
+                    }
+                    last_ctrl_x = cur_x;
+                    last_ctrl_y = cur_y;
+                    last_cmd = cur_cmd;
+                }
+                'V' | 'v' => {
+                    let Some(y) = next_num(&mut idx) else { break };
+                    if cur_cmd == 'v' {
+                        cur_y += y;
+                    } else {
+                        cur_y = y;
+                    }
+                    if in_figure {
+                        sink.AddLine(pt(cur_x, cur_y));
+                    }
+                    last_ctrl_x = cur_x;
+                    last_ctrl_y = cur_y;
+                    last_cmd = cur_cmd;
+                }
+                'C' | 'c' => {
+                    let Some(x1) = next_num(&mut idx) else { break };
+                    let Some(y1) = next_num(&mut idx) else { break };
+                    let Some(x2) = next_num(&mut idx) else { break };
+                    let Some(y2) = next_num(&mut idx) else { break };
+                    let Some(x) = next_num(&mut idx) else { break };
+                    let Some(y) = next_num(&mut idx) else { break };
+                    let (cp1x, cp1y, cp2x, cp2y, ex, ey) = if cur_cmd == 'c' {
+                        (
+                            cur_x + x1,
+                            cur_y + y1,
+                            cur_x + x2,
+                            cur_y + y2,
+                            cur_x + x,
+                            cur_y + y,
+                        )
+                    } else {
+                        (x1, y1, x2, y2, x, y)
+                    };
+                    if in_figure {
+                        sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                            point1: pt(cp1x, cp1y),
+                            point2: pt(cp2x, cp2y),
+                            point3: pt(ex, ey),
+                        });
+                    }
+                    cur_x = ex;
+                    cur_y = ey;
+                    last_ctrl_x = cp2x;
+                    last_ctrl_y = cp2y;
+                    last_cmd = cur_cmd;
+                }
+                'S' | 's' => {
+                    let Some(x2) = next_num(&mut idx) else { break };
+                    let Some(y2) = next_num(&mut idx) else { break };
+                    let Some(x) = next_num(&mut idx) else { break };
+                    let Some(y) = next_num(&mut idx) else { break };
+                    let (cp1x, cp1y) = if matches!(last_cmd, 'C' | 'c' | 'S' | 's') {
+                        (2.0 * cur_x - last_ctrl_x, 2.0 * cur_y - last_ctrl_y)
+                    } else {
+                        (cur_x, cur_y)
+                    };
+                    let (cp2x, cp2y, ex, ey) = if cur_cmd == 's' {
+                        (cur_x + x2, cur_y + y2, cur_x + x, cur_y + y)
+                    } else {
+                        (x2, y2, x, y)
+                    };
+                    if in_figure {
+                        sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                            point1: pt(cp1x, cp1y),
+                            point2: pt(cp2x, cp2y),
+                            point3: pt(ex, ey),
+                        });
+                    }
+                    cur_x = ex;
+                    cur_y = ey;
+                    last_ctrl_x = cp2x;
+                    last_ctrl_y = cp2y;
+                    last_cmd = cur_cmd;
+                }
+                'Q' | 'q' => {
+                    let Some(qx1) = next_num(&mut idx) else { break };
+                    let Some(qy1) = next_num(&mut idx) else { break };
+                    let Some(x) = next_num(&mut idx) else { break };
+                    let Some(y) = next_num(&mut idx) else { break };
+                    let (qx, qy, ex, ey) = if cur_cmd == 'q' {
+                        (cur_x + qx1, cur_y + qy1, cur_x + x, cur_y + y)
+                    } else {
+                        (qx1, qy1, x, y)
+                    };
+                    let cp1x = cur_x + (2.0 / 3.0) * (qx - cur_x);
+                    let cp1y = cur_y + (2.0 / 3.0) * (qy - cur_y);
+                    let cp2x = ex + (2.0 / 3.0) * (qx - ex);
+                    let cp2y = ey + (2.0 / 3.0) * (qy - ey);
+                    if in_figure {
+                        sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                            point1: pt(cp1x, cp1y),
+                            point2: pt(cp2x, cp2y),
+                            point3: pt(ex, ey),
+                        });
+                    }
+                    cur_x = ex;
+                    cur_y = ey;
+                    last_ctrl_x = qx;
+                    last_ctrl_y = qy;
+                    last_cmd = cur_cmd;
+                }
+                _ => {
+                    break;
+                }
+            }
+        }
+
+        if in_figure {
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+        }
+        sink.Close().map_err(|e| format!("Sink.Close 失败: {}", e))?;
+        let _ = D2D1_FIGURE_BEGIN_HOLLOW;
+        let _ = D2D_SIZE_F::default();
+        Ok(path)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,7 +789,10 @@ pub struct D2DRenderer {
     pub font_body: IDWriteTextFormat,
     pub font_body_bold: IDWriteTextFormat,
     pub font_caption: IDWriteTextFormat,
+    pub font_small: IDWriteTextFormat,
     pub font_mono: IDWriteTextFormat,
+    pub font_material_icon: Option<IDWriteTextFormat>,
+    icon_font_loader: Option<IDWriteInMemoryFontFileLoader>,
     pub dpi_scale: f32,
     icon_cache: RefCell<Vec<(u32, ID2D1Bitmap, f32)>>,
 }
@@ -257,6 +801,11 @@ impl Drop for D2DRenderer {
     fn drop(&mut self) {
         self.free_dib();
         unsafe {
+            if let Some(ref loader) = self.icon_font_loader {
+                if let Ok(factory5) = self.dwrite_factory.cast::<IDWriteFactory5>() {
+                    let _ = factory5.UnregisterFontFileLoader(loader);
+                }
+            }
             if !self.mem_dc.0.is_null() {
                 let _ = DeleteDC(self.mem_dc);
             }
@@ -299,7 +848,62 @@ impl D2DRenderer {
             let font_body_bold =
                 create_fmt("Microsoft YaHei UI", 12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let font_caption = create_fmt("Microsoft YaHei UI", 11.5, DWRITE_FONT_WEIGHT_REGULAR)?;
+            let font_small = create_fmt("Microsoft YaHei UI", 10.2, DWRITE_FONT_WEIGHT_REGULAR)?;
             let font_mono = create_fmt("Consolas", 12.0, DWRITE_FONT_WEIGHT_REGULAR)?;
+
+            // Load embedded MaterialIcons-Regular.ttf from the `material-icons` crate into DirectWrite
+            let mut icon_font_loader: Option<IDWriteInMemoryFontFileLoader> = None;
+            let mut font_material_icon: Option<IDWriteTextFormat> = None;
+            if let Ok(factory5) = dwrite_factory.cast::<IDWriteFactory5>() {
+                if let Ok(loader) = factory5.CreateInMemoryFontFileLoader() {
+                    if factory5.RegisterFontFileLoader(&loader).is_ok() {
+                        if let Ok(font_file) = loader.CreateInMemoryFontFileReference(
+                            &factory5,
+                            MATERIAL_ICONS_FONT.as_ptr() as *const _,
+                            MATERIAL_ICONS_FONT.len() as u32,
+                            None,
+                        ) {
+                            if let Ok(builder) = factory5.CreateFontSetBuilder() {
+                                if builder.AddFontFile(&font_file).is_ok() {
+                                    if let Ok(font_set) = builder.CreateFontSet() {
+                                        if let Ok(collection1) =
+                                            factory5.CreateFontCollectionFromFontSet(&font_set)
+                                        {
+                                            if let Ok(collection) =
+                                                collection1.cast::<IDWriteFontCollection>()
+                                            {
+                                                let fam_w = to_wide("Material Icons");
+                                                let locale_w = to_wide("en-US");
+                                                if let Ok(fmt) = dwrite_factory.CreateTextFormat(
+                                                    PCWSTR(fam_w.as_ptr()),
+                                                    &collection,
+                                                    DWRITE_FONT_WEIGHT_REGULAR,
+                                                    DWRITE_FONT_STYLE_NORMAL,
+                                                    DWRITE_FONT_STRETCH_NORMAL,
+                                                    16.0,
+                                                    PCWSTR(locale_w.as_ptr()),
+                                                ) {
+                                                    let _ = fmt.SetTextAlignment(
+                                                        DWRITE_TEXT_ALIGNMENT_CENTER,
+                                                    );
+                                                    let _ = fmt.SetParagraphAlignment(
+                                                        DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                                                    );
+                                                    let _ = fmt.SetWordWrapping(
+                                                        DWRITE_WORD_WRAPPING_NO_WRAP,
+                                                    );
+                                                    font_material_icon = Some(fmt);
+                                                    icon_font_loader = Some(loader);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let mem_dc = CreateCompatibleDC(HDC::default());
 
@@ -320,7 +924,10 @@ impl D2DRenderer {
                 font_body,
                 font_body_bold,
                 font_caption,
+                font_small,
                 font_mono,
+                font_material_icon,
+                icon_font_loader,
                 dpi_scale: 1.0,
                 icon_cache: RefCell::new(Vec::new()),
             })
@@ -641,38 +1248,48 @@ impl D2DRenderer {
         wrap: bool,
     ) {
         unsafe {
-            let _ = fmt.SetTextAlignment(match h_align {
+            // Auto-shrink single-line body/caption text so it fits inside rect.w without clipping
+            let mut active_fmt = fmt;
+            if !wrap && rect.w > 8.0 {
+                if std::ptr::eq(fmt, &self.font_body) || std::ptr::eq(fmt, &self.font_body_bold) {
+                    if self.measure_text_width(text, fmt) > rect.w - 1.0 {
+                        active_fmt = &self.font_caption;
+                        if self.measure_text_width(text, active_fmt) > rect.w - 1.0 {
+                            active_fmt = &self.font_small;
+                        }
+                    }
+                } else if std::ptr::eq(fmt, &self.font_caption)
+                    && self.measure_text_width(text, fmt) > rect.w - 1.0
+                {
+                    active_fmt = &self.font_small;
+                }
+            }
+
+            let _ = active_fmt.SetTextAlignment(match h_align {
                 1 => DWRITE_TEXT_ALIGNMENT_CENTER,
                 2 => DWRITE_TEXT_ALIGNMENT_TRAILING,
                 _ => DWRITE_TEXT_ALIGNMENT_LEADING,
             });
-            let _ = fmt.SetParagraphAlignment(match v_align {
+            let _ = active_fmt.SetParagraphAlignment(match v_align {
                 1 => DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
                 _ => DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             });
             if wrap {
-                let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
-                let no_trim = DWRITE_TRIMMING {
-                    granularity: DWRITE_TRIMMING_GRANULARITY_NONE,
-                    delimiter: 0,
-                    delimiterCount: 0,
-                };
-                let _ = fmt.SetTrimming(&no_trim, None);
+                let _ = active_fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
             } else {
-                let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-                let ellipsis = self.dwrite_factory.CreateEllipsisTrimmingSign(fmt).ok();
-                let trim = DWRITE_TRIMMING {
-                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                    delimiter: 0,
-                    delimiterCount: 0,
-                };
-                let _ = fmt.SetTrimming(&trim, ellipsis.as_ref());
+                let _ = active_fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
             }
+            let no_trim = DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_NONE,
+                delimiter: 0,
+                delimiterCount: 0,
+            };
+            let _ = active_fmt.SetTrimming(&no_trim, None);
 
             let wide: Vec<u16> = text.encode_utf16().collect();
             self.rt().DrawText(
                 &wide,
-                fmt,
+                active_fmt,
                 &rect.to_d2d(),
                 self.brush(color),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -728,262 +1345,51 @@ impl D2DRenderer {
         }
     }
 
-    /// Draw crisp vector icons using Direct2D primitives and PathGeometry.
+    /// Draw crisp Google MaterialIcons using the embedded `material-icons` crate font (`MaterialIcons-Regular.ttf`)
+    /// with Direct2D `ID2D1PathGeometry` as fallback.
     pub fn draw_icon(&self, icon: VectorIcon, cx: f32, cy: f32, size: f32, color: D2D1_COLOR_F) {
-        let half = size * 0.5;
-        match icon {
-            VectorIcon::Check => {
-                self.draw_line(
-                    cx - half * 0.55,
-                    cy + half * 0.05,
-                    cx - half * 0.12,
-                    cy + half * 0.48,
-                    2.2,
-                    color,
-                );
-                self.draw_line(
-                    cx - half * 0.12,
-                    cy + half * 0.48,
-                    cx + half * 0.62,
-                    cy - half * 0.42,
-                    2.2,
-                    color,
-                );
-            }
-            VectorIcon::Folder => {
-                let r = RectF::new(
-                    cx - half * 0.8,
-                    cy - half * 0.45,
-                    size * 0.8,
-                    size * 0.58,
-                );
-                let tab = RectF::new(
-                    cx - half * 0.8,
-                    cy - half * 0.68,
-                    size * 0.36,
-                    size * 0.28,
-                );
-                self.fill_rounded_rect(tab, 2.0, color);
-                self.draw_rounded_rect(r, 2.5, 1.8, color);
-            }
-            VectorIcon::Document => {
-                let r = RectF::new(
-                    cx - half * 0.62,
-                    cy - half * 0.78,
-                    size * 0.62,
-                    size * 0.78,
-                );
-                self.draw_rounded_rect(r, 2.5, 1.7, color);
-                self.draw_line(
-                    cx - half * 0.35,
-                    cy - half * 0.25,
-                    cx + half * 0.35,
-                    cy - half * 0.25,
-                    1.5,
-                    color,
-                );
-                self.draw_line(
-                    cx - half * 0.35,
-                    cy + half * 0.08,
-                    cx + half * 0.35,
-                    cy + half * 0.08,
-                    1.5,
-                    color,
-                );
-                self.draw_line(
-                    cx - half * 0.35,
-                    cy + half * 0.40,
-                    cx + half * 0.15,
-                    cy + half * 0.40,
-                    1.5,
-                    color,
-                );
-            }
-            VectorIcon::Info => {
-                self.draw_circle(cx, cy, half * 0.78, 1.8, color);
-                self.fill_circle(cx, cy - half * 0.36, 1.5, color);
-                self.draw_line(cx, cy - half * 0.08, cx, cy + half * 0.44, 2.0, color);
-            }
-            VectorIcon::Shield => {
-                unsafe {
-                    if let Ok(path) = self.d2d_factory.CreatePathGeometry() {
-                        if let Ok(sink) = path.Open() {
-                            sink.BeginFigure(
-                                D2D_POINT_2F {
-                                    x: cx,
-                                    y: cy - half * 0.82,
-                                },
-                                D2D1_FIGURE_BEGIN_HOLLOW,
-                            );
-                            let pts = [
-                                D2D_POINT_2F {
-                                    x: cx + half * 0.72,
-                                    y: cy - half * 0.52,
-                                },
-                                D2D_POINT_2F {
-                                    x: cx + half * 0.64,
-                                    y: cy + half * 0.18,
-                                },
-                                D2D_POINT_2F {
-                                    x: cx,
-                                    y: cy + half * 0.82,
-                                },
-                                D2D_POINT_2F {
-                                    x: cx - half * 0.64,
-                                    y: cy + half * 0.18,
-                                },
-                                D2D_POINT_2F {
-                                    x: cx - half * 0.72,
-                                    y: cy - half * 0.52,
-                                },
-                            ];
-                            sink.AddLines(&pts);
-                            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                            let _ = sink.Close();
-                            self.rt().DrawGeometry(&path, self.brush(color), 1.8, None);
-                        }
-                    }
-                }
-            }
-            VectorIcon::Rocket => {
-                self.draw_circle(cx, cy - half * 0.1, half * 0.45, 1.8, color);
-                self.draw_line(
-                    cx,
-                    cy - half * 0.85,
-                    cx - half * 0.48,
-                    cy + half * 0.45,
-                    1.8,
-                    color,
-                );
-                self.draw_line(
-                    cx,
-                    cy - half * 0.85,
-                    cx + half * 0.48,
-                    cy + half * 0.45,
-                    1.8,
-                    color,
-                );
-                self.draw_line(
-                    cx - half * 0.48,
-                    cy + half * 0.45,
-                    cx + half * 0.48,
-                    cy + half * 0.45,
-                    1.8,
-                    color,
-                );
-                self.draw_line(cx, cy + half * 0.45, cx, cy + half * 0.85, 2.2, color);
-            }
-            VectorIcon::HardDrive => {
-                let r = RectF::new(
-                    cx - half * 0.82,
-                    cy - half * 0.48,
-                    size * 0.82,
-                    size * 0.48,
-                );
-                self.draw_rounded_rect(r, 3.0, 1.8, color);
-                self.fill_circle(cx + half * 0.45, cy, 2.0, color);
-                self.draw_line(cx - half * 0.52, cy, cx + half * 0.12, cy, 1.8, color);
-            }
-            VectorIcon::Trash => {
-                let body = RectF::new(
-                    cx - half * 0.52,
-                    cy - half * 0.38,
-                    size * 0.52,
-                    size * 0.62,
-                );
-                self.draw_rounded_rect(body, 2.0, 1.7, color);
-                self.draw_line(
-                    cx - half * 0.72,
-                    cy - half * 0.42,
-                    cx + half * 0.72,
-                    cy - half * 0.42,
-                    1.8,
-                    color,
-                );
-                self.draw_line(
-                    cx - half * 0.25,
-                    cy - half * 0.65,
-                    cx + half * 0.25,
-                    cy - half * 0.65,
-                    1.8,
-                    color,
-                );
-            }
-            VectorIcon::Sun => {
-                self.draw_circle(cx, cy, half * 0.42, 1.8, color);
-                for i in 0..8 {
-                    let angle = (i as f32) * std::f32::consts::PI / 4.0;
-                    let x1 = cx + angle.cos() * half * 0.62;
-                    let y1 = cy + angle.sin() * half * 0.62;
-                    let x2 = cx + angle.cos() * half * 0.86;
-                    let y2 = cy + angle.sin() * half * 0.86;
-                    self.draw_line(x1, y1, x2, y2, 1.6, color);
-                }
-            }
-            VectorIcon::Moon => {
-                self.draw_circle(cx, cy, half * 0.62, 1.8, color);
-                self.fill_circle(cx + half * 0.25, cy - half * 0.2, half * 0.42, color);
-            }
-            VectorIcon::Minimize => {
-                self.draw_line(cx - 5.5, cy, cx + 5.5, cy, 1.8, color);
-            }
-            VectorIcon::Close => {
-                self.draw_line(cx - 5.0, cy - 5.0, cx + 5.0, cy + 5.0, 1.8, color);
-                self.draw_line(cx + 5.0, cy - 5.0, cx - 5.0, cy + 5.0, 1.8, color);
-            }
-            VectorIcon::Sparkles => {
-                self.draw_line(cx, cy - half * 0.75, cx, cy + half * 0.75, 1.8, color);
-                self.draw_line(cx - half * 0.75, cy, cx + half * 0.75, cy, 1.8, color);
-                self.draw_line(
-                    cx - half * 0.42,
-                    cy - half * 0.42,
-                    cx + half * 0.42,
-                    cy + half * 0.42,
-                    1.4,
-                    color,
-                );
-                self.draw_line(
-                    cx + half * 0.42,
-                    cy - half * 0.42,
-                    cx - half * 0.42,
-                    cy + half * 0.42,
-                    1.4,
-                    color,
-                );
-            }
-            VectorIcon::Play => {
-                unsafe {
-                    if let Ok(path) = self.d2d_factory.CreatePathGeometry() {
-                        if let Ok(sink) = path.Open() {
-                            sink.BeginFigure(
-                                D2D_POINT_2F {
-                                    x: cx - half * 0.4,
-                                    y: cy - half * 0.58,
-                                },
-                                D2D1_FIGURE_BEGIN_FILLED,
-                            );
-                            let pts = [
-                                D2D_POINT_2F {
-                                    x: cx + half * 0.58,
-                                    y: cy,
-                                },
-                                D2D_POINT_2F {
-                                    x: cx - half * 0.4,
-                                    y: cy + half * 0.58,
-                                },
-                            ];
-                            sink.AddLines(&pts);
-                            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                            let _ = sink.Close();
-                            self.rt().FillGeometry(&path, self.brush(color), None);
-                        }
-                    }
+        if let Some(ref fmt) = self.font_material_icon {
+            let ch = icon.material_char();
+            let mut buf = [0u16; 2];
+            let wide = ch.encode_utf16(&mut buf);
+            let box_size = size * 1.6;
+            unsafe {
+                if let Ok(layout) =
+                    self.dwrite_factory
+                        .CreateTextLayout(wide, fmt, box_size, box_size)
+                {
+                    let _ = layout.SetFontSize(
+                        size * 1.18,
+                        DWRITE_TEXT_RANGE {
+                            startPosition: 0,
+                            length: wide.len() as u32,
+                        },
+                    );
+                    self.rt().DrawTextLayout(
+                        D2D_POINT_2F {
+                            x: cx - box_size * 0.5,
+                            y: cy - box_size * 0.5,
+                        },
+                        &layout,
+                        self.brush(color),
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                    return;
                 }
             }
         }
-        let _ = D2D1_BEZIER_SEGMENT::default();
-        let _ = D2D1_FIGURE_END_OPEN;
-        let _ = D2D_SIZE_F::default();
+
+        if let Ok(path) = build_material_icon_geometry(
+            &self.d2d_factory,
+            icon.material_svg_path(),
+            cx,
+            cy,
+            size,
+        ) {
+            unsafe {
+                self.rt().FillGeometry(&path, self.brush(color), None);
+            }
+        }
     }
 
     /// Draw a Material 3 Button with centered icon + label and ripple clipping.
@@ -1052,10 +1458,21 @@ impl D2DRenderer {
         self.draw_ripples(ripples, rect);
 
         if let Some(ic) = icon {
-            let text_w = self.measure_text_width(label, &self.font_body_bold);
-            let icon_size = 15.0;
-            let gap = 7.0;
-            let total_w = (icon_size + gap + text_w).min(rect.w - 12.0);
+            let body_w = self.measure_text_width(label, &self.font_body_bold);
+            let icon_size = 14.0;
+            let gap = if icon_size + 6.0 + body_w > rect.w - 8.0 {
+                4.5
+            } else {
+                6.5
+            };
+            let use_caption = icon_size + gap + body_w > rect.w - 6.0;
+            let fmt = if use_caption {
+                &self.font_caption
+            } else {
+                &self.font_body_bold
+            };
+            let text_w = self.measure_text_width(label, fmt);
+            let total_w = (icon_size + gap + text_w).min(rect.w - 4.0);
             let start_x = rect.x + (rect.w - total_w) * 0.5;
             let icon_cx = start_x + icon_size * 0.5;
             let icon_cy = rect.y + rect.h * 0.5;
@@ -1064,16 +1481,64 @@ impl D2DRenderer {
             let text_rect = RectF::new(
                 start_x + icon_size + gap,
                 rect.y,
-                (rect.x + rect.w - (start_x + icon_size + gap) - 4.0).max(10.0),
+                (text_w + 8.0).max(rect.x + rect.w - (start_x + icon_size + gap)),
                 rect.h,
             );
-            self.draw_text(label, &self.font_body_bold, text_rect, fg, 0, 1, false);
+            self.draw_text(label, fmt, text_rect, fg, 0, 1, false);
         } else {
-            self.draw_text(label, &self.font_body_bold, rect, fg, 1, 1, false);
+            self.draw_text(label, &self.font_body_bold, rect.inset(2.0, 0.0), fg, 1, 1, false);
         }
     }
 
-    /// Draw a Material Outlined TextField with label above and focus highlight.
+    /// Compute horizontal scroll offset for a text field so that `caret_pos` remains in view.
+    pub fn text_field_scroll_x(&self, rect: RectF, value: &str, caret_pos: usize) -> f32 {
+        let inner = rect.inset(10.0, 4.0);
+        let char_len = TextInputState::char_len(value);
+        let clamped_caret = caret_pos.min(char_len);
+        let prefix_b = TextInputState::byte_index_of_char(value, clamped_caret);
+        let caret_x = self.measure_text_width(&value[..prefix_b], &self.font_body);
+        if caret_x > inner.w - 6.0 {
+            caret_x - (inner.w - 6.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Hit-test a mouse `mx` coordinate inside a text field `rect`, returning the closest character index.
+    pub fn hit_test_text_field_char(
+        &self,
+        rect: RectF,
+        value: &str,
+        mx: f32,
+        current_caret_pos: usize,
+    ) -> usize {
+        let inner = rect.inset(10.0, 4.0);
+        let scroll_x = if current_caret_pos <= TextInputState::char_len(value) {
+            self.text_field_scroll_x(rect, value, current_caret_pos)
+        } else {
+            0.0
+        };
+        let target_x = (mx - inner.x + scroll_x).max(0.0);
+
+        let char_len = TextInputState::char_len(value);
+        let mut best_idx = 0usize;
+        let mut best_dist = target_x.abs();
+
+        for i in 1..=char_len {
+            let b = TextInputState::byte_index_of_char(value, i);
+            let w = self.measure_text_width(&value[..b], &self.font_body);
+            let dist = (w - target_x).abs();
+            if dist <= best_dist {
+                best_dist = dist;
+                best_idx = i;
+            } else {
+                break;
+            }
+        }
+        best_idx
+    }
+
+    /// Draw a Material Outlined TextField with label above, selection highlight, and cursor caret.
     pub fn draw_text_field(
         &self,
         rect: RectF,
@@ -1084,7 +1549,41 @@ impl D2DRenderer {
         caret_visible: bool,
         palette: &MaterialPalette,
     ) {
-        let label_rect = RectF::new(rect.x + 2.0, rect.y - 20.0, rect.w, 18.0);
+        let default_sel = TextInputState {
+            caret_pos: TextInputState::char_len(value),
+            sel_anchor: TextInputState::char_len(value),
+            is_dragging: false,
+        };
+        self.draw_text_field_with_sel(
+            rect,
+            label,
+            value,
+            focused,
+            hovered,
+            caret_visible,
+            &default_sel,
+            palette,
+        );
+    }
+
+    /// Draw a Material Outlined TextField with full `TextInputState` (selection range + cursor position).
+    pub fn draw_text_field_with_sel(
+        &self,
+        rect: RectF,
+        label: &str,
+        value: &str,
+        focused: bool,
+        hovered: bool,
+        caret_visible: bool,
+        input_state: &TextInputState,
+        palette: &MaterialPalette,
+    ) {
+        let label_rect = RectF::new(
+            rect.x + 2.0,
+            rect.y - 20.0,
+            (rect.w - 2.0).max(0.0),
+            18.0,
+        );
         let label_color = if focused {
             palette.primary
         } else {
@@ -1110,37 +1609,276 @@ impl D2DRenderer {
         };
         self.draw_rounded_rect(rect, 8.0, stroke, border_col);
 
-        let inner = rect.inset(12.0, 4.0);
+        let inner = rect.inset(10.0, 4.0);
         unsafe {
             self.rt()
                 .PushAxisAlignedClip(&inner.to_d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
 
-        let display_str = if focused && caret_visible {
-            format!("{}|", value)
+        let char_len = TextInputState::char_len(value);
+        let caret_pos = if focused {
+            input_state.caret_pos.min(char_len)
         } else {
-            value.to_string()
+            0
+        };
+        let scroll_x = if focused {
+            self.text_field_scroll_x(rect, value, caret_pos)
+        } else {
+            0.0
         };
 
-        let text_w = self.measure_text_width(&display_str, &self.font_body);
-        let draw_rect = if focused && text_w > inner.w {
-            RectF::new(inner.x + inner.w - text_w - 4.0, inner.y, text_w + 12.0, inner.h)
-        } else {
-            inner
-        };
+        // 1. Draw selection highlight if focused and has selection
+        if focused && input_state.has_selection() {
+            let (s0, s1) = input_state.selection_range(value);
+            let b0 = TextInputState::byte_index_of_char(value, s0);
+            let b1 = TextInputState::byte_index_of_char(value, s1);
+            let x0 = inner.x - scroll_x + self.measure_text_width(&value[..b0], &self.font_body);
+            let x1 = inner.x - scroll_x + self.measure_text_width(&value[..b1], &self.font_body);
+            let sel_rect = RectF::new(x0, inner.y + 3.0, (x1 - x0).max(2.0), inner.h - 6.0);
+            let sel_col = if palette.mode == ThemeMode::Light {
+                rgba(0x4F46E5, 0.24)
+            } else {
+                rgba(0x6366F1, 0.42)
+            };
+            self.fill_rounded_rect(sel_rect, 3.0, sel_col);
+        }
 
-        self.draw_text(
-            &display_str,
-            &self.font_body,
-            draw_rect,
-            palette.text_primary,
-            0,
-            1,
-            false,
+        // 2. Draw text content without ellipsis trimming
+        let total_w = self.measure_text_width(value, &self.font_body);
+        let draw_rect = RectF::new(
+            inner.x - scroll_x,
+            inner.y,
+            (total_w + 40.0).max(inner.w),
+            inner.h,
         );
+        unsafe {
+            let _ = self
+                .font_body
+                .SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            let _ = self
+                .font_body
+                .SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            let _ = self.font_body.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            let no_trim = DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_NONE,
+                delimiter: 0,
+                delimiterCount: 0,
+            };
+            let _ = self.font_body.SetTrimming(&no_trim, None);
+            let wide: Vec<u16> = value.encode_utf16().collect();
+            self.rt().DrawText(
+                &wide,
+                &self.font_body,
+                &draw_rect.to_d2d(),
+                self.brush(palette.text_primary),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+        }
+
+        // 3. Draw vertical caret bar at caret_pos
+        if focused && caret_visible {
+            let b_caret = TextInputState::byte_index_of_char(value, caret_pos);
+            let cx =
+                (inner.x - scroll_x + self.measure_text_width(&value[..b_caret], &self.font_body))
+                    .clamp(inner.x + 1.0, inner.x + inner.w - 1.5);
+            self.draw_line(
+                cx,
+                inner.y + 4.0,
+                cx,
+                inner.y + inner.h - 4.0,
+                1.8,
+                palette.primary,
+            );
+        }
 
         unsafe {
             self.rt().PopAxisAlignedClip();
+        }
+    }
+
+    /// Draw a Material 3 Dropdown Select Trigger Box with label above and chevron icon.
+    pub fn draw_dropdown(
+        &self,
+        rect: RectF,
+        label: &str,
+        selected_text: &str,
+        is_open: bool,
+        hovered: bool,
+        palette: &MaterialPalette,
+    ) {
+        if !label.is_empty() {
+            let label_rect = RectF::new(
+                rect.x + 2.0,
+                rect.y - 20.0,
+                (rect.w - 2.0).max(0.0),
+                18.0,
+            );
+            let label_color = if is_open {
+                palette.primary
+            } else {
+                palette.text_secondary
+            };
+            self.draw_text(
+                label,
+                &self.font_caption,
+                label_rect,
+                label_color,
+                0,
+                1,
+                false,
+            );
+        }
+
+        let bg = if is_open {
+            palette.primary_container
+        } else if hovered {
+            rgba(0x6366F1, 0.06)
+        } else {
+            palette.surface_variant
+        };
+        self.fill_rounded_rect(rect, 8.0, bg);
+
+        let (border_col, stroke) = if is_open {
+            (palette.primary, 1.8)
+        } else if hovered {
+            (palette.primary, 1.2)
+        } else {
+            (palette.outline, 1.0)
+        };
+        self.draw_rounded_rect(rect, 8.0, stroke, border_col);
+
+        let text_rect = RectF::new(rect.x + 10.0, rect.y, (rect.w - 30.0).max(10.0), rect.h);
+        let fg = if is_open {
+            palette.on_primary_container
+        } else {
+            palette.text_primary
+        };
+        self.draw_text(selected_text, &self.font_body, text_rect, fg, 0, 1, false);
+
+        let chev = if is_open {
+            VectorIcon::ChevronUp
+        } else {
+            VectorIcon::ChevronDown
+        };
+        self.draw_icon(
+            chev,
+            rect.x + rect.w - 14.0,
+            rect.y + rect.h * 0.5,
+            13.0,
+            if is_open {
+                palette.primary
+            } else {
+                palette.text_secondary
+            },
+        );
+    }
+
+    /// Compute the bounding rectangle of an open dropdown popup menu.
+    pub fn dropdown_menu_rect(
+        &self,
+        trigger_rect: RectF,
+        items: &[&str],
+        window_w: f32,
+        window_h: f32,
+    ) -> RectF {
+        let mut max_item_w = 0.0f32;
+        for item in items {
+            let w = self.measure_text_width(item, &self.font_body);
+            if w > max_item_w {
+                max_item_w = w;
+            }
+        }
+        let menu_w = trigger_rect.w.max(max_item_w + 46.0);
+        let menu_x = trigger_rect.x.min((window_w - menu_w - 16.0).max(16.0));
+        let item_h = 32.0;
+        let menu_h = (items.len() as f32) * item_h + 8.0;
+        let below_y = trigger_rect.y + trigger_rect.h + 4.0;
+        let menu_y = if below_y + menu_h > window_h - 14.0 {
+            (trigger_rect.y - menu_h - 4.0).max(14.0)
+        } else {
+            below_y
+        };
+        RectF::new(menu_x, menu_y, menu_w, menu_h)
+    }
+
+    /// Draw a floating Material 3 Dropdown Popup Menu on top of other UI controls.
+    pub fn draw_dropdown_menu(
+        &self,
+        trigger_rect: RectF,
+        items: &[&str],
+        selected_idx: usize,
+        mx: f32,
+        my: f32,
+        window_w: f32,
+        window_h: f32,
+        palette: &MaterialPalette,
+    ) {
+        let menu_rect = self.dropdown_menu_rect(trigger_rect, items, window_w, window_h);
+
+        // Elevated drop shadow
+        for i in (1..=4).rev() {
+            let sp = i as f32 * 2.0;
+            let sr = RectF::new(
+                menu_rect.x - sp * 0.4,
+                menu_rect.y + sp * 0.8,
+                menu_rect.w + sp * 0.8,
+                menu_rect.h + sp,
+            );
+            self.fill_rounded_rect(sr, 10.0, rgba(0x000000, 0.08 / (i as f32)));
+        }
+
+        self.fill_rounded_rect(menu_rect, 8.0, palette.surface_elevated);
+        self.draw_rounded_rect(menu_rect, 8.0, 1.3, palette.primary);
+
+        let item_h = 32.0;
+        for (idx, item_label) in items.iter().enumerate() {
+            let ir = RectF::new(
+                menu_rect.x + 4.0,
+                menu_rect.y + 4.0 + (idx as f32) * item_h,
+                menu_rect.w - 8.0,
+                item_h,
+            );
+            let is_sel = idx == selected_idx;
+            let is_hov = ir.contains(mx, my);
+
+            if is_hov {
+                self.fill_rounded_rect(ir, 6.0, palette.primary_container);
+            } else if is_sel {
+                self.fill_rounded_rect(ir, 6.0, rgba(0x6366F1, 0.08));
+            }
+
+            if is_sel {
+                self.draw_icon(
+                    VectorIcon::Check,
+                    ir.x + 14.0,
+                    ir.y + item_h * 0.5,
+                    12.0,
+                    palette.primary,
+                );
+            }
+
+            let fg = if is_hov {
+                palette.on_primary_container
+            } else if is_sel {
+                palette.primary
+            } else {
+                palette.text_primary
+            };
+            let font = if is_sel {
+                &self.font_body_bold
+            } else {
+                &self.font_body
+            };
+            self.draw_text(
+                item_label,
+                font,
+                RectF::new(ir.x + 28.0, ir.y, ir.w - 34.0, item_h),
+                fg,
+                0,
+                1,
+                false,
+            );
         }
     }
 
@@ -1466,7 +2204,7 @@ mod tests {
             d2d.draw_window_header(
                 800.0,
                 "Nyan Studio App v1.0.0 安装向导",
-                "CRT-Static",
+                "",
                 &pal,
                 false,
                 false,
@@ -1478,5 +2216,73 @@ mod tests {
         let out_bmp = out_dir.join("test_titlebar.bmp");
         let _ = d2d.save_bmp(&out_bmp);
         assert!(out_bmp.exists());
+    }
+
+    #[test]
+    fn test_text_input_selection_and_editing() {
+        let mut s = "Hello 世界".to_string();
+        let mut st = TextInputState::default();
+        st.select_all(&s);
+        assert!(st.has_selection());
+        assert_eq!(st.selected_text(&s), Some("Hello 世界"));
+
+        st.insert_str(&mut s, "Nyan");
+        assert_eq!(s, "Nyan");
+        assert!(!st.has_selection());
+        assert_eq!(st.caret_pos, 4);
+
+        st.move_left(&s, true);
+        st.move_left(&s, true);
+        assert_eq!(st.selected_text(&s), Some("an"));
+
+        st.backspace(&mut s);
+        assert_eq!(s, "Ny");
+    }
+
+    #[test]
+    fn test_material_icons_svg_geometry_renders_all() {
+        let mut d2d = D2DRenderer::new().expect("D2D Init");
+        assert!(
+            d2d.font_material_icon.is_some(),
+            "In-memory MaterialIcons-Regular.ttf from material-icons crate should load into DirectWrite"
+        );
+        d2d.resize(512, 64, 96);
+        let pal = MaterialPalette::light();
+        let all_icons = [
+            VectorIcon::Info,
+            VectorIcon::Folder,
+            VectorIcon::Document,
+            VectorIcon::Rocket,
+            VectorIcon::Check,
+            VectorIcon::Shield,
+            VectorIcon::HardDrive,
+            VectorIcon::Trash,
+            VectorIcon::Sun,
+            VectorIcon::Moon,
+            VectorIcon::Minimize,
+            VectorIcon::Close,
+            VectorIcon::Sparkles,
+            VectorIcon::Play,
+            VectorIcon::ChevronDown,
+            VectorIcon::ChevronUp,
+        ];
+        unsafe {
+            d2d.rt().BeginDraw();
+            d2d.rt().Clear(Some(&pal.surface));
+            for (i, icon) in all_icons.iter().enumerate() {
+                assert!(!icon.material_name().is_empty());
+                assert!(icon.material_char() as u32 >= 0xE000);
+                let geom = build_material_icon_geometry(
+                    &d2d.d2d_factory,
+                    icon.material_svg_path(),
+                    20.0 + (i as f32) * 30.0,
+                    32.0,
+                    20.0,
+                );
+                assert!(geom.is_ok(), "Failed to build MaterialIcon {:?}", icon);
+                d2d.draw_icon(*icon, 20.0 + (i as f32) * 30.0, 32.0, 20.0, pal.primary);
+            }
+            let _ = d2d.rt().EndDraw(None, None);
+        }
     }
 }

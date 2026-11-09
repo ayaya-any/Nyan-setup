@@ -10,9 +10,313 @@ pub const PACKAGE_MAGIC: &[u8; 8] = b"NYANPK02";
 pub const FOOTER_SIZE: u64 = 40;
 pub const UNINSTALL_DATA_FILE: &str = "unins000.dat";
 pub const UNINSTALL_EXE_FILE: &str = "unins000.exe";
+pub const PREREQ_VIRTUAL_PREFIX: &str = "__nyan_prereq__/";
 
 fn default_true() -> bool {
     true
+}
+
+fn default_exists_op() -> CheckOperator {
+    CheckOperator::Exists
+}
+
+fn default_exit_codes() -> Vec<i32> {
+    vec![0, 1638, 3010]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegHiveRoot {
+    Hklm,
+    Hkcu,
+    Hkcr,
+    Hku,
+}
+
+impl Default for RegHiveRoot {
+    fn default() -> Self {
+        Self::Hklm
+    }
+}
+
+impl RegHiveRoot {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Hklm => "HKLM",
+            Self::Hkcu => "HKCU",
+            Self::Hkcr => "HKCR",
+            Self::Hku => "HKU",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Hklm => Self::Hkcu,
+            Self::Hkcu => Self::Hkcr,
+            Self::Hkcr => Self::Hku,
+            Self::Hku => Self::Hklm,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegArchView {
+    Default,
+    X64,
+    X86,
+}
+
+impl Default for RegArchView {
+    fn default() -> Self {
+        Self::X64
+    }
+}
+
+impl RegArchView {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Default => "默认视图",
+            Self::X64 => "64位视图",
+            Self::X86 => "32位视图",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Default => Self::X64,
+            Self::X64 => Self::X86,
+            Self::X86 => Self::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckOperator {
+    Exists,
+    NotExists,
+    Equals,
+    NotEquals,
+    GreaterOrEqual,
+    Contains,
+}
+
+impl Default for CheckOperator {
+    fn default() -> Self {
+        Self::Equals
+    }
+}
+
+impl CheckOperator {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Exists => "存在",
+            Self::NotExists => "不存在",
+            Self::Equals => "等于 (==)",
+            Self::NotEquals => "不等于 (!=)",
+            Self::GreaterOrEqual => "版本/数值 >=",
+            Self::Contains => "包含文本",
+        }
+    }
+
+    pub fn next_for_registry(&self) -> Self {
+        match self {
+            Self::Equals => Self::GreaterOrEqual,
+            Self::GreaterOrEqual => Self::Exists,
+            Self::Exists => Self::NotExists,
+            Self::NotExists => Self::Contains,
+            Self::Contains => Self::NotEquals,
+            Self::NotEquals => Self::Equals,
+        }
+    }
+
+    pub fn next_for_file(&self) -> Self {
+        match self {
+            Self::Exists => Self::GreaterOrEqual,
+            Self::GreaterOrEqual => Self::Equals,
+            Self::Equals => Self::NotExists,
+            _ => Self::Exists,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrereqCondition {
+    Registry {
+        #[serde(default)]
+        root: RegHiveRoot,
+        subkey: String,
+        #[serde(default)]
+        value_name: String,
+        #[serde(default)]
+        arch_view: RegArchView,
+        #[serde(default)]
+        operator: CheckOperator,
+        #[serde(default)]
+        expected: String,
+    },
+    File {
+        path: String,
+        #[serde(default = "default_exists_op")]
+        operator: CheckOperator,
+        #[serde(default)]
+        expected_version: String,
+    },
+}
+
+impl PrereqCondition {
+    pub fn is_registry(&self) -> bool {
+        matches!(self, Self::Registry { .. })
+    }
+
+    pub fn short_tag(&self) -> &'static str {
+        match self {
+            Self::Registry { .. } => "注册表",
+            Self::File { .. } => "文件/PE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrereqAction {
+    RunBundledExe {
+        source_file: String,
+        #[serde(default)]
+        bundled_rel_path: String,
+        #[serde(default)]
+        args: String,
+        #[serde(default = "default_true")]
+        elevate: bool,
+        #[serde(default = "default_true")]
+        wait: bool,
+        #[serde(default = "default_exit_codes")]
+        success_exit_codes: Vec<i32>,
+    },
+    RunCommand {
+        program: String,
+        #[serde(default)]
+        args: String,
+        #[serde(default)]
+        elevate: bool,
+        #[serde(default = "default_true")]
+        wait: bool,
+        #[serde(default = "default_exit_codes")]
+        success_exit_codes: Vec<i32>,
+    },
+    PromptAndAbort {
+        message: String,
+        #[serde(default)]
+        download_url: String,
+    },
+}
+
+impl PrereqAction {
+    pub fn short_tag(&self) -> &'static str {
+        match self {
+            Self::RunBundledExe { .. } => "捆绑安装",
+            Self::RunCommand { .. } => "执行命令",
+            Self::PromptAndAbort { .. } => "弹窗拦截",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrerequisiteRule {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub condition: PrereqCondition,
+    pub action: PrereqAction,
+}
+
+impl PrerequisiteRule {
+    pub fn preset_vc_redist_x64() -> Self {
+        Self {
+            name: "VC++ 2015-2022 (x64)".to_string(),
+            enabled: true,
+            condition: PrereqCondition::Registry {
+                root: RegHiveRoot::Hklm,
+                subkey: "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64".to_string(),
+                value_name: "Installed".to_string(),
+                arch_view: RegArchView::X64,
+                operator: CheckOperator::Equals,
+                expected: "1".to_string(),
+            },
+            action: PrereqAction::RunBundledExe {
+                source_file: "vc_redist.x64.exe".to_string(),
+                bundled_rel_path: String::new(),
+                args: "/install /quiet /norestart".to_string(),
+                elevate: true,
+                wait: true,
+                success_exit_codes: default_exit_codes(),
+            },
+        }
+    }
+
+    pub fn preset_vc_redist_x86() -> Self {
+        Self {
+            name: "VC++ 2015-2022 (x86)".to_string(),
+            enabled: true,
+            condition: PrereqCondition::Registry {
+                root: RegHiveRoot::Hklm,
+                subkey: "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x86".to_string(),
+                value_name: "Installed".to_string(),
+                arch_view: RegArchView::X86,
+                operator: CheckOperator::Equals,
+                expected: "1".to_string(),
+            },
+            action: PrereqAction::RunBundledExe {
+                source_file: "vc_redist.x86.exe".to_string(),
+                bundled_rel_path: String::new(),
+                args: "/install /quiet /norestart".to_string(),
+                elevate: true,
+                wait: true,
+                success_exit_codes: default_exit_codes(),
+            },
+        }
+    }
+
+    pub fn preset_custom_registry() -> Self {
+        Self {
+            name: "WebView2 注册表检测".to_string(),
+            enabled: true,
+            condition: PrereqCondition::Registry {
+                root: RegHiveRoot::Hklm,
+                subkey: "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}".to_string(),
+                value_name: "pv".to_string(),
+                arch_view: RegArchView::X86,
+                operator: CheckOperator::GreaterOrEqual,
+                expected: "100.0.0.0".to_string(),
+            },
+            action: PrereqAction::PromptAndAbort {
+                message: "系统缺少 Microsoft Edge WebView2 运行时，请先安装后再运行本安装程序。".to_string(),
+                download_url: "https://developer.microsoft.com/microsoft-edge/webview2/".to_string(),
+            },
+        }
+    }
+
+    pub fn preset_custom_file_version() -> Self {
+        Self {
+            name: "vcruntime140 版本检测".to_string(),
+            enabled: true,
+            condition: PrereqCondition::File {
+                path: "%SystemRoot%\\System32\\vcruntime140_1.dll".to_string(),
+                operator: CheckOperator::GreaterOrEqual,
+                expected_version: "14.30.0.0".to_string(),
+            },
+            action: PrereqAction::RunBundledExe {
+                source_file: "vc_redist.x64.exe".to_string(),
+                bundled_rel_path: String::new(),
+                args: "/install /quiet /norestart".to_string(),
+                elevate: true,
+                wait: true,
+                success_exit_codes: default_exit_codes(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +337,8 @@ pub struct PackageConfig {
     pub compression_level: u32,
     #[serde(default)]
     pub installer_icon: Option<String>,
+    #[serde(default)]
+    pub prerequisites: Vec<PrerequisiteRule>,
 }
 
 impl Default for PackageConfig {
@@ -52,6 +358,7 @@ impl Default for PackageConfig {
             kill_process_on_update: true,
             compression_level: 6,
             installer_icon: None,
+            prerequisites: Vec::new(),
         }
     }
 }
@@ -170,6 +477,7 @@ pub enum InstallProgressEvent {
         bytes_done: u64,
         bytes_total: u64,
     },
+    RunningPrerequisite(String),
     CreatingShortcuts,
     RegisteringUninstaller,
     Completed {
@@ -383,9 +691,54 @@ pub fn build_installer_package(
         }
     };
 
-    let files = collect_source_files(source_dir).map_err(|e| format!("扫描源目录失败: {}", e))?;
+    let mut files = collect_source_files(source_dir).map_err(|e| format!("扫描源目录失败: {}", e))?;
     if files.is_empty() {
         return Err("源目录中没有可打包的文件，请检查源目录路径。".to_string());
+    }
+
+    // Resolve and append any bundled prerequisite executables
+    let mut manifest_config = config.clone();
+    for (rule_idx, rule) in manifest_config.prerequisites.iter_mut().enumerate() {
+        if !rule.enabled {
+            continue;
+        }
+        if let PrereqAction::RunBundledExe {
+            ref source_file,
+            ref mut bundled_rel_path,
+            ..
+        } = rule.action
+        {
+            let trimmed = source_file.trim();
+            if trimmed.is_empty() {
+                return Err(format!("前置规则 [{}] 未指定捆绑可执行文件路径", rule.name));
+            }
+            let cand = PathBuf::from(trimmed);
+            let resolved = if cand.is_file() {
+                cand
+            } else if source_dir.join(&cand).is_file() {
+                source_dir.join(&cand)
+            } else {
+                return Err(format!(
+                    "前置规则 [{}] 指定的捆绑程序不存在: {}",
+                    rule.name, trimmed
+                ));
+            };
+            let meta = fs::metadata(&resolved).map_err(|e| {
+                format!(
+                    "读取前置规则 [{}] 捆绑程序 {} 失败: {}",
+                    rule.name,
+                    resolved.display(),
+                    e
+                )
+            })?;
+            let fname = resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("prereq_{}.exe", rule_idx));
+            let v_rel = format!("{}prereq_{}_{}", PREREQ_VIRTUAL_PREFIX, rule_idx, fname);
+            *bundled_rel_path = v_rel.clone();
+            files.push((resolved, v_rel, meta.len()));
+        }
     }
 
     notify(BuildProgressEvent::Scanning(files.len()));
@@ -508,7 +861,7 @@ pub fn build_installer_package(
     notify(BuildProgressEvent::Finalizing);
 
     let manifest = PackageManifest {
-        config: config.clone(),
+        config: manifest_config,
         files: file_entries,
         total_uncompressed_bytes,
         total_compressed_bytes,
@@ -566,10 +919,63 @@ pub fn extract_package_files(
         .map_err(|e| format!("读取安装包尾标失败: {}", e))?
         .ok_or_else(|| "安装包尾标损坏或格式不受支持".to_string())?;
 
+    // 1. Pre-check Prerequisite rules:
+    //    - PromptAndAbort rules fail fast before touching disk
+    //    - RunBundledExe rules determine which bundled installers need extraction to %TEMP%
+    let mut needed_bundled_prereqs: Vec<(usize, String, PathBuf)> = Vec::new();
+    for (rule_idx, rule) in manifest.config.prerequisites.iter().enumerate() {
+        if !rule.enabled {
+            continue;
+        }
+        let passed =
+            crate::win32_ops::evaluate_prereq_condition(&rule.condition, Some(target_install_dir));
+        if !passed {
+            match rule.action {
+                PrereqAction::PromptAndAbort {
+                    ref message,
+                    ref download_url,
+                } => {
+                    crate::win32_ops::prompt_prereq_abort(&rule.name, message, download_url);
+                    return Err(format!("环境检测未通过 [{}]: {}", rule.name, message));
+                }
+                PrereqAction::RunBundledExe {
+                    ref bundled_rel_path,
+                    ref source_file,
+                    ..
+                } => {
+                    let rel_key = if !bundled_rel_path.is_empty() {
+                        bundled_rel_path.clone()
+                    } else {
+                        let fname = Path::new(source_file)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| format!("prereq_{}.exe", rule_idx));
+                        format!("{}prereq_{}_{}", PREREQ_VIRTUAL_PREFIX, rule_idx, fname)
+                    };
+                    let safe_fname = Path::new(&rel_key)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("prereq_{}.exe", rule_idx));
+                    let temp_dest = std::env::temp_dir().join(format!(
+                        "nyan_setup_{}_{}_{}",
+                        std::process::id(),
+                        rule_idx,
+                        safe_fname
+                    ));
+                    needed_bundled_prereqs.push((rule_idx, rel_key, temp_dest));
+                }
+                PrereqAction::RunCommand { .. } => {}
+            }
+        }
+    }
+
     let mut exe_names: Vec<String> = manifest
         .files
         .iter()
-        .filter(|f| f.relative_path.to_ascii_lowercase().ends_with(".exe"))
+        .filter(|f| {
+            !f.relative_path.starts_with(PREREQ_VIRTUAL_PREFIX)
+                && f.relative_path.to_ascii_lowercase().ends_with(".exe")
+        })
         .map(|f| f.relative_path.clone())
         .collect();
     if !manifest.config.main_exe.is_empty() && !exe_names.contains(&manifest.config.main_exe) {
@@ -610,6 +1016,43 @@ pub fn extract_package_files(
                 bytes_done,
                 bytes_total,
             });
+        }
+
+        // Handle bundled prerequisite files
+        if entry.relative_path.starts_with(PREREQ_VIRTUAL_PREFIX) {
+            if let Some((_, _, ref temp_dest)) = needed_bundled_prereqs
+                .iter()
+                .find(|(_, rel_key, _)| rel_key == &entry.relative_path)
+            {
+                let mut raw_buf = vec![0u8; entry.uncompressed_size as usize];
+                lzma_reader.read_exact(&mut raw_buf).map_err(|e| {
+                    format!("解压前置组件 {} 失败: {}", entry.relative_path, e)
+                })?;
+                if entry.bcj_filtered {
+                    bcj_x86_decode(&mut raw_buf);
+                }
+                let mut hasher = Hasher::new();
+                hasher.update(&raw_buf);
+                let actual_crc = hasher.finalize();
+                if actual_crc != entry.crc32 {
+                    return Err(format!(
+                        "前置组件 {} CRC32 校验失败 (期望 {:08X}, 实际 {:08X})",
+                        entry.relative_path, entry.crc32, actual_crc
+                    ));
+                }
+                fs::write(temp_dest, &raw_buf).map_err(|e| {
+                    format!("释放临时前置安装包 {} 失败: {}", temp_dest.display(), e)
+                })?;
+            } else {
+                // Prerequisite already satisfied on system -> discard stream bytes without disk write
+                io::copy(
+                    &mut (&mut lzma_reader).take(entry.uncompressed_size),
+                    &mut io::sink(),
+                )
+                .map_err(|e| format!("跳过已满足的前置组件流 {} 失败: {}", entry.relative_path, e))?;
+            }
+            bytes_done += entry.uncompressed_size;
+            continue;
         }
 
         let clean_rel: PathBuf = entry
@@ -680,6 +1123,69 @@ pub fn extract_package_files(
 
         bytes_done += entry.uncompressed_size;
         installed_files.push(clean_rel.to_string_lossy().to_string());
+    }
+
+    // 2. Execute unsatisfied Prerequisite actions (RunBundledExe & RunCommand)
+    for (rule_idx, rule) in manifest.config.prerequisites.iter().enumerate() {
+        if !rule.enabled {
+            continue;
+        }
+        match rule.action {
+            PrereqAction::RunBundledExe {
+                ref args,
+                elevate,
+                wait,
+                ref success_exit_codes,
+                ..
+            } => {
+                if let Some((_, _, ref temp_exe)) = needed_bundled_prereqs
+                    .iter()
+                    .find(|(r_idx, _, _)| *r_idx == rule_idx)
+                {
+                    if let Some(tx) = progress_tx {
+                        let _ = tx.send(InstallProgressEvent::RunningPrerequisite(rule.name.clone()));
+                    }
+                    let exec_res = crate::win32_ops::execute_prereq_command(
+                        &rule.name,
+                        &temp_exe.to_string_lossy(),
+                        args,
+                        elevate,
+                        wait,
+                        success_exit_codes,
+                        Some(target_install_dir),
+                    );
+                    let _ = fs::remove_file(temp_exe);
+                    exec_res?;
+                }
+            }
+            PrereqAction::RunCommand {
+                ref program,
+                ref args,
+                elevate,
+                wait,
+                ref success_exit_codes,
+            } => {
+                let passed = crate::win32_ops::evaluate_prereq_condition(
+                    &rule.condition,
+                    Some(target_install_dir),
+                );
+                if !passed {
+                    if let Some(tx) = progress_tx {
+                        let _ = tx.send(InstallProgressEvent::RunningPrerequisite(rule.name.clone()));
+                    }
+                    crate::win32_ops::execute_prereq_command(
+                        &rule.name,
+                        program,
+                        args,
+                        elevate,
+                        wait,
+                        success_exit_codes,
+                        Some(target_install_dir),
+                    )?;
+                }
+            }
+            PrereqAction::PromptAndAbort { .. } => {}
+        }
     }
 
     Ok(installed_files)
@@ -786,6 +1292,104 @@ mod tests {
         assert_eq!(first_unins, custom_frames[0].data, "uninstaller RT_ICON equals custom icon frame");
 
         // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_bundled_prerequisite_packaging_and_conditional_execution() {
+        let current_exe = std::env::current_exe().expect("current exe");
+        let temp_dir =
+            std::env::temp_dir().join(format!("nyan_test_prereq_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let src_dir = temp_dir.join("src");
+        let _ = fs::create_dir_all(&src_dir);
+        fs::write(src_dir.join("app.txt"), b"Main Application Payload").unwrap();
+
+        // Create a dummy bundled prerequisite executable (use cmd.exe copy so it can run with /C)
+        let sys_cmd = PathBuf::from(
+            std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string()),
+        );
+        let mock_redist = temp_dir.join("mock_vc_redist.exe");
+        fs::copy(&sys_cmd, &mock_redist).expect("copy cmd.exe as mock_vc_redist.exe");
+
+        let out_installer = temp_dir.join("PrereqSetup.exe");
+        let mut cfg = PackageConfig::default();
+        cfg.main_exe = "app.txt".to_string();
+
+        // Rule 1: Condition that is ALREADY SATISFIED (kernel32.dll exists) -> should NOT run
+        let satisfied_marker = temp_dir.join("should_not_exist.txt");
+        cfg.prerequisites.push(PrerequisiteRule {
+            name: "Satisfied Rule".to_string(),
+            enabled: true,
+            condition: PrereqCondition::File {
+                path: "%SystemRoot%\\System32\\kernel32.dll".to_string(),
+                operator: CheckOperator::Exists,
+                expected_version: String::new(),
+            },
+            action: PrereqAction::RunBundledExe {
+                source_file: mock_redist.to_string_lossy().to_string(),
+                bundled_rel_path: String::new(),
+                args: format!("/C echo skip > \"{}\"", satisfied_marker.display()),
+                elevate: false,
+                wait: true,
+                success_exit_codes: vec![0],
+            },
+        });
+
+        // Rule 2: Condition that is UNSATISFIED (non-existent registry key) -> SHOULD extract to %TEMP%, run, and clean up %TEMP%
+        let unsatisfied_marker = temp_dir.join("prereq_executed_ok.txt");
+        cfg.prerequisites.push(PrerequisiteRule {
+            name: "Unsatisfied VC Runtime Mock".to_string(),
+            enabled: true,
+            condition: PrereqCondition::Registry {
+                root: RegHiveRoot::Hkcu,
+                subkey: "Software\\NyanNonExistentRuntimeKey_99999".to_string(),
+                value_name: "Installed".to_string(),
+                arch_view: RegArchView::Default,
+                operator: CheckOperator::Equals,
+                expected: "1".to_string(),
+            },
+            action: PrereqAction::RunBundledExe {
+                source_file: mock_redist.to_string_lossy().to_string(),
+                bundled_rel_path: String::new(),
+                args: format!("/C echo installed > \"{}\"", unsatisfied_marker.display()),
+                elevate: false,
+                wait: true,
+                success_exit_codes: vec![0],
+            },
+        });
+
+        build_installer_package(&current_exe, &src_dir, &out_installer, &cfg, None)
+            .expect("build installer with bundled prerequisites");
+
+        let (_footer, manifest) = read_package_from_exe(&out_installer)
+            .expect("read io")
+            .expect("manifest");
+
+        // Package manifest has 1 normal file + 2 bundled prerequisite entries
+        assert_eq!(manifest.files.len(), 3);
+
+        let install_target = temp_dir.join("installed_app");
+        let installed_files =
+            extract_package_files(&out_installer, &manifest, &install_target, false, None)
+                .expect("extract and run prereqs");
+
+        // Only `app.txt` is recorded in `installed_files` (bundled prereqs are excluded from uninstaller receipt)
+        assert_eq!(installed_files, vec!["app.txt".to_string()]);
+        assert!(install_target.join("app.txt").exists());
+
+        // Rule 1 was satisfied -> marker must NOT exist
+        assert!(
+            !satisfied_marker.exists(),
+            "Satisfied prerequisite should be skipped!"
+        );
+        // Rule 2 was unsatisfied -> marker MUST exist
+        assert!(
+            unsatisfied_marker.exists(),
+            "Unsatisfied bundled prerequisite should have executed!"
+        );
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }
