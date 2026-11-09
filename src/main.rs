@@ -276,35 +276,244 @@ fn main() {
                     }
                 }
             }
+            "init-config" => {
+                attach_parent_console();
+                let out_json = args
+                    .get(2)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("package.json"));
+                let mut sample_cfg = PackageConfig::default();
+                sample_cfg.prerequisites = vec![crate::package::PrerequisiteRule::preset_vc_redist_x64()];
+                let template = serde_json::json!({
+                    "source_dir": "./build_output",
+                    "output_exe": "./dist/NyanStudioApp_Setup.exe",
+                    "app_id": sample_cfg.app_id,
+                    "app_name": sample_cfg.app_name,
+                    "app_version": sample_cfg.app_version,
+                    "publisher": sample_cfg.publisher,
+                    "main_exe": sample_cfg.main_exe,
+                    "default_install_dir": sample_cfg.default_install_dir,
+                    "create_desktop_shortcut": sample_cfg.create_desktop_shortcut,
+                    "create_start_menu_shortcut": sample_cfg.create_start_menu_shortcut,
+                    "register_uninstaller": sample_cfg.register_uninstaller,
+                    "auto_launch_after_install": sample_cfg.auto_launch_after_install,
+                    "process_conflict_policy": sample_cfg.process_conflict_policy,
+                    "compression_level": sample_cfg.compression_level,
+                    "installer_icon": null,
+                    "license_text": sample_cfg.license_text,
+                    "prerequisites": sample_cfg.prerequisites,
+                });
+                let pretty = serde_json::to_string_pretty(&template).unwrap_or_default();
+                if let Some(parent) = out_json.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                }
+                match fs::write(&out_json, pretty) {
+                    Ok(()) => {
+                        println!(
+                            "[SUCCESS] Generated template configuration file: {}",
+                            out_json.display()
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[ERROR] Failed to write configuration file {}: {}",
+                            out_json.display(),
+                            e
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
             "pack" => {
                 attach_parent_console();
-                // Usage: nyan-setup.exe pack <source_dir> <output_exe> [app_name] [version] [main_exe]
-                if args.len() < 4 {
-                    eprintln!(
-                        "Usage: nyan-setup.exe pack <source_dir> <output_exe> [app_name] [version] [main_exe]"
-                    );
-                    std::process::exit(1);
-                }
-                let src_dir = PathBuf::from(&args[2]);
-                let out_exe = PathBuf::from(&args[3]);
-                let mut cfg = PackageConfig::default();
-                if let Some(name) = args.get(4) {
-                    cfg.app_name = name.clone();
-                    cfg.default_install_dir = format!("%LOCALAPPDATA%\\Programs\\{}", name);
-                }
-                if let Some(ver) = args.get(5) {
-                    cfg.app_version = ver.clone();
-                }
-                if let Some(m_exe) = args.get(6) {
-                    if !m_exe.starts_with("--") {
-                        cfg.main_exe = m_exe.clone();
+                // Mode A: Config-based packing:
+                //   nyan-setup.exe pack --config <package.json> [--source <dir>] [--output <exe>] [--icon <ico>]
+                //   or nyan-setup.exe pack <package.json>
+                let config_arg_pos = args
+                    .iter()
+                    .position(|a| a == "--config" || a == "-c")
+                    .map(|p| p + 1)
+                    .or_else(|| {
+                        if args.len() >= 3 && args[2].to_ascii_lowercase().ends_with(".json") {
+                            Some(2)
+                        } else {
+                            None
+                        }
+                    });
+
+                let (src_dir, out_exe, cfg) = if let Some(cfg_idx) = config_arg_pos {
+                    let Some(cfg_path_str) = args.get(cfg_idx) else {
+                        eprintln!("Usage: nyan-setup.exe pack --config <package.json> [--source <dir>] [--output <exe>] [--icon <ico>]");
+                        std::process::exit(1);
+                    };
+                    let cfg_path = PathBuf::from(cfg_path_str);
+                    let cfg_base_dir = cfg_path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+                    let raw_json = match fs::read_to_string(&cfg_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!(
+                                "[ERROR] 无法读取配置文件 {}: {}",
+                                cfg_path.display(),
+                                e
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let val: serde_json::Value = match serde_json::from_str(&raw_json) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "[ERROR] 解析 JSON 配置文件 {} 失败: {}",
+                                cfg_path.display(),
+                                e
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let has_explicit_install_dir = val.get("default_install_dir").is_some();
+                    let json_source_dir = val
+                        .get("source_dir")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let json_output_exe = val
+                        .get("output_exe")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    let mut parsed_cfg: PackageConfig = match serde_json::from_value(val) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!(
+                                "[ERROR] 配置文件字段格式错误 {}: {}",
+                                cfg_path.display(),
+                                e
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+
+                    if !has_explicit_install_dir && !parsed_cfg.app_name.trim().is_empty() {
+                        parsed_cfg.default_install_dir =
+                            format!("%LOCALAPPDATA%\\Programs\\{}", parsed_cfg.app_name);
+                    }
+
+                    let cli_source = args
+                        .iter()
+                        .position(|a| a == "--source" || a == "-s")
+                        .and_then(|p| args.get(p + 1))
+                        .cloned();
+                    let cli_output = args
+                        .iter()
+                        .position(|a| a == "--output" || a == "-o")
+                        .and_then(|p| args.get(p + 1))
+                        .cloned();
+                    if let Some(pos) = args.iter().position(|a| a == "--icon") {
+                        if let Some(ico) = args.get(pos + 1) {
+                            parsed_cfg.installer_icon = Some(ico.clone());
+                        }
+                    }
+
+                    let resolve_rel = |raw: &str| -> PathBuf {
+                        let p = PathBuf::from(raw);
+                        if p.is_absolute() || p.exists() {
+                            p
+                        } else {
+                            let rel_to_cfg = cfg_base_dir.join(&p);
+                            if rel_to_cfg.exists() || !p.starts_with(".") {
+                                rel_to_cfg
+                            } else {
+                                p
+                            }
+                        }
+                    };
+
+                    let Some(src_raw) = cli_source.or(json_source_dir) else {
+                        eprintln!("[ERROR] 配置文件缺少 `source_dir` 字段，且未通过 `--source <dir>` 指定源目录");
+                        std::process::exit(1);
+                    };
+                    let Some(out_raw) = cli_output.or(json_output_exe) else {
+                        eprintln!("[ERROR] 配置文件缺少 `output_exe` 字段，且未通过 `--output <exe>` 指定输出安装包路径");
+                        std::process::exit(1);
+                    };
+
+                    if let Some(ref ico_str) = parsed_cfg.installer_icon.clone() {
+                        if !ico_str.trim().is_empty() {
+                            let resolved_ico = resolve_rel(ico_str.trim());
+                            parsed_cfg.installer_icon =
+                                Some(resolved_ico.to_string_lossy().to_string());
+                        }
+                    }
+
+                    for rule in &mut parsed_cfg.prerequisites {
+                        if let crate::package::PrereqAction::RunBundledExe {
+                            ref mut source_file,
+                            ..
+                        } = rule.action
+                        {
+                            if !source_file.trim().is_empty() {
+                                let resolved_redist = resolve_rel(source_file.trim());
+                                if resolved_redist.is_file() {
+                                    *source_file =
+                                        resolved_redist.to_string_lossy().to_string();
+                                }
+                            }
+                        }
+                    }
+
+                    (resolve_rel(&src_raw), resolve_rel(&out_raw), parsed_cfg)
+                } else {
+                    // Mode B: Positional CLI quick pack:
+                    //   nyan-setup.exe pack <source_dir> <output_exe> [app_name] [version] [main_exe] [--icon <ico>]
+                    if args.len() < 4 {
+                        eprintln!(
+                            "Usage:\n  nyan-setup.exe pack --config <package.json> [--source <dir>] [--output <exe>] [--icon <ico>]\n  nyan-setup.exe pack <source_dir> <output_exe> [app_name] [version] [main_exe] [--icon <ico>]"
+                        );
+                        std::process::exit(1);
+                    }
+                    let src_dir = PathBuf::from(&args[2]);
+                    let out_exe = PathBuf::from(&args[3]);
+                    let mut cfg = PackageConfig::default();
+                    if let Some(name) = args.get(4) {
+                        if !name.starts_with("--") {
+                            cfg.app_name = name.clone();
+                            cfg.default_install_dir =
+                                format!("%LOCALAPPDATA%\\Programs\\{}", name);
+                        }
+                    }
+                    if let Some(ver) = args.get(5) {
+                        if !ver.starts_with("--") {
+                            cfg.app_version = ver.clone();
+                        }
+                    }
+                    if let Some(m_exe) = args.get(6) {
+                        if !m_exe.starts_with("--") {
+                            cfg.main_exe = m_exe.clone();
+                        }
+                    }
+                    if let Some(pos) = args.iter().position(|a| a == "--icon") {
+                        if let Some(ico) = args.get(pos + 1) {
+                            cfg.installer_icon = Some(ico.clone());
+                        }
+                    }
+                    (src_dir, out_exe, cfg)
+                };
+
+                if let Some(parent) = out_exe.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = fs::create_dir_all(parent);
                     }
                 }
-                if let Some(pos) = args.iter().position(|a| a == "--icon") {
-                    if let Some(ico) = args.get(pos + 1) {
-                        cfg.installer_icon = Some(ico.clone());
-                    }
-                }
+
                 match build_installer_package(&current_exe, &src_dir, &out_exe, &cfg, None) {
                     Ok((count, raw_sz, final_sz)) => {
                         println!(

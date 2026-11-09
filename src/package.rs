@@ -335,6 +335,7 @@ impl Default for ProcessConflictPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PackageConfig {
     pub app_id: String,
     pub app_name: String,
