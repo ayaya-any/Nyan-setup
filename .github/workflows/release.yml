@@ -72,7 +72,7 @@ jobs:
           }
           $ChecksumLines | Out-File -FilePath (Join-Path $DistDir "SHA256SUMS.txt") -Encoding utf8
 
-          Write-Host "Prepared release artifacts in $DistDir:"
+          Write-Host "Prepared release artifacts in ${DistDir}:"
           Get-ChildItem -Path $DistDir | Select-Object Name, Length
 
       - name: Publish GitHub Release
