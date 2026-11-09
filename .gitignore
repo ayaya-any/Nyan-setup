@@ -35,3 +35,6 @@ $RECYCLE.BIN/
 *.log
 *.tmp
 *.bak
+
+# ---- Local helper scripts ----
+/scripts/
