@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build, Test & Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Run test suite
+        run: cargo test --release --verbose
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Prepare release artifacts
+        shell: pwsh
+        run: |
+          $Tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev' }
+          $DistDir = "dist"
+          New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+
+          # 1. Copy standalone Nyan Setup Studio & CLI binary
+          $ExeSrc = "target/release/nyan-setup.exe"
+          $ExeDist = "$DistDir/nyan-setup.exe"
+          Copy-Item -Path $ExeSrc -Destination $ExeDist
+
+          # 2. Generate a template package.sample.json configuration file
+          Start-Process -FilePath $ExeDist -ArgumentList "init-config", "$DistDir/package.sample.json" -NoNewWindow -Wait
+
+          # 3. Build a standalone demo installer Setup executable
+          Start-Process -FilePath $ExeDist -ArgumentList "build-demo", "$DistDir/NyanStudioApp_Demo_Setup.exe" -NoNewWindow -Wait
+
+          # 4. Pack a ZIP archive bundle containing executable, config template, and docs
+          $ZipBundle = "$DistDir/nyan-setup-$Tag-windows-x86_64.zip"
+          $ZipItems = @(
+            $ExeDist,
+            "$DistDir/package.sample.json",
+            "README.md",
+            "docs"
+          )
+          Compress-Archive -Path $ZipItems -DestinationPath $ZipBundle -Force
+
+          # 5. Generate SHA256 checksums for all release assets
+          $HashFiles = Get-ChildItem -Path $DistDir -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" }
+          $ChecksumLines = foreach ($file in $HashFiles) {
+            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
+            $name = $file.Name
+            "$hash  $name"
+          }
+          $ChecksumLines | Out-File -FilePath "$DistDir/SHA256SUMS.txt" -Encoding utf8
+
+          Write-Host "Prepared release artifacts in $DistDir:"
+          Get-ChildItem -Path $DistDir | Select-Object Name, Length
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/nyan-setup.exe
+            dist/NyanStudioApp_Demo_Setup.exe
+            dist/nyan-setup-*.zip
+            dist/package.sample.json
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
