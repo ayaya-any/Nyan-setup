@@ -6,6 +6,7 @@ Real-time progress tracker for Nyan-setup release workflows.
 """
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -13,6 +14,11 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+
+# Ensure proper UTF-8 output under Windows console
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 DEFAULT_REPO = "ayaya-any/Nyan-setup"
 
@@ -44,7 +50,7 @@ def api_get(url):
         return None, None
 
 def find_workflow_run(repo, tag, max_wait_sec=120, poll_sec=5):
-    url = f"https://api.github.com/repos/{repo}/actions/runs?event=push&per_page=10"
+    url = f"https://api.github.com/repos/{repo}/actions/runs?event=push&per_page=15"
     print(f"[*] 正在检索仓库 {repo} 中与标签 [{tag}] 关联的 GitHub Actions 工作流...")
     start_time = time.time()
     dots = 0
@@ -53,8 +59,8 @@ def find_workflow_run(repo, tag, max_wait_sec=120, poll_sec=5):
         data, remaining = api_get(url)
         if data and "workflow_runs" in data:
             for run in data["workflow_runs"]:
-                # Check if head_branch matches tag or head_sha matches current tag
                 branch = run.get("head_branch") or ""
+                # Match latest run for this tag
                 if branch == tag or tag in run.get("display_title", ""):
                     print(f"\n[+] 找到工作流运行: Run ID {run['id']} ({run['name']})")
                     print(f"    网页链接: {run.get('html_url')}")
@@ -73,7 +79,6 @@ def monitor_run(repo, run_id, poll_sec=8):
     jobs_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
 
     start_monitor = time.time()
-    last_step_summary = ""
 
     while True:
         run_data, _ = api_get(run_url)
@@ -106,6 +111,8 @@ def monitor_run(repo, run_id, poll_sec=8):
                         icon = "[OK]"
                     elif s_conc in ("failure", "timed_out"):
                         icon = "[ERR]"
+                    elif s_conc == "skipped":
+                        icon = "[SKIP]"
                     elif s_status == "in_progress":
                         icon = "[RUNNING]"
                     elif s_status == "queued":
@@ -115,7 +122,6 @@ def monitor_run(repo, run_id, poll_sec=8):
 
                     job_lines.append(f"    {icon:<10} {s_name}")
 
-        current_summary = "\n".join(job_lines)
         now_str = datetime.now().strftime("%H:%M:%S")
 
         print("=" * 64)
@@ -134,21 +140,27 @@ def monitor_run(repo, run_id, poll_sec=8):
 def check_release_assets(repo, tag):
     release_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
     print(f"\n[*] 查询 GitHub Release 详情与上传资产 ({tag})...")
-    data, _ = api_get(release_url)
+    # Poll a few times if release is still finalizing
+    for _ in range(5):
+        data, _ = api_get(release_url)
+        if data and data.get("assets"):
+            break
+        time.sleep(3)
+
     if not data:
         print("[!] 暂未获取到 Release 信息，可能正在同步中。")
         return
 
-    print(f"[+] Release 发布成功！")
+    print(f"\n[+] GitHub Release 发布成功！")
     print(f"    标题: {data.get('name') or data.get('tag_name')}")
-    print(f"    链接: {data.get('html_url')}")
+    print(f"    页面: {data.get('html_url')}")
     assets = data.get("assets", [])
     if assets:
         print(f"\n    已上传附件列表 ({len(assets)} 个):")
         for asset in assets:
             sz_mb = asset.get("size", 0) / (1024 * 1024)
             print(f"      - {asset.get('name')} ({sz_mb:.2f} MB)")
-            print(f"        下载链接: {asset.get('browser_download_url')}")
+            print(f"        下载: {asset.get('browser_download_url')}")
     else:
         print("    (暂无附件)")
 

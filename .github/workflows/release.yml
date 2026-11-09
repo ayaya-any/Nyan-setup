@@ -36,29 +36,31 @@ jobs:
         shell: pwsh
         run: |
           $Tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev' }
-          $DistDir = "dist"
-          New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+          $DistDir = (New-Item -ItemType Directory -Force -Path "dist").FullName
 
           # 1. Copy standalone Nyan Setup Studio & CLI binary
-          $ExeSrc = "target/release/nyan-setup.exe"
-          $ExeDist = "$DistDir/nyan-setup.exe"
-          Copy-Item -Path $ExeSrc -Destination $ExeDist
+          $ExeDist = Join-Path $DistDir "nyan-setup.exe"
+          Copy-Item -Path "target/release/nyan-setup.exe" -Destination $ExeDist
+          $ExeDistResolved = (Resolve-Path $ExeDist).Path
 
           # 2. Generate a template package.sample.json configuration file
-          Start-Process -FilePath $ExeDist -ArgumentList "init-config", "$DistDir/package.sample.json" -NoNewWindow -Wait
+          $ConfigSample = Join-Path $DistDir "package.sample.json"
+          Start-Process -FilePath $ExeDistResolved -ArgumentList "init-config", $ConfigSample -NoNewWindow -Wait
 
           # 3. Build a standalone demo installer Setup executable
-          Start-Process -FilePath $ExeDist -ArgumentList "build-demo", "$DistDir/NyanStudioApp_Demo_Setup.exe" -NoNewWindow -Wait
+          $DemoInstaller = Join-Path $DistDir "NyanStudioApp_Demo_Setup.exe"
+          Start-Process -FilePath $ExeDistResolved -ArgumentList "build-demo", $DemoInstaller -NoNewWindow -Wait
 
           # 4. Pack a ZIP archive bundle containing executable, config template, and docs
-          $ZipBundle = "$DistDir/nyan-setup-$Tag-windows-x86_64.zip"
-          $ZipItems = @(
-            $ExeDist,
-            "$DistDir/package.sample.json",
-            "README.md",
-            "docs"
-          )
-          Compress-Archive -Path $ZipItems -DestinationPath $ZipBundle -Force
+          $ZipBundle = Join-Path $DistDir "nyan-setup-$Tag-windows-x86_64.zip"
+          $StageDir = Join-Path $DistDir "bundle_staging"
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          Copy-Item -Path $ExeDist -Destination $StageDir
+          Copy-Item -Path $ConfigSample -Destination $StageDir
+          Copy-Item -Path "README.md" -Destination $StageDir
+          Copy-Item -Path "docs" -Destination $StageDir -Recurse
+          Compress-Archive -Path "$StageDir/*" -DestinationPath $ZipBundle -Force
+          Remove-Item -Recurse -Force $StageDir
 
           # 5. Generate SHA256 checksums for all release assets
           $HashFiles = Get-ChildItem -Path $DistDir -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" }
@@ -67,7 +69,7 @@ jobs:
             $name = $file.Name
             "$hash  $name"
           }
-          $ChecksumLines | Out-File -FilePath "$DistDir/SHA256SUMS.txt" -Encoding utf8
+          $ChecksumLines | Out-File -FilePath (Join-Path $DistDir "SHA256SUMS.txt") -Encoding utf8
 
           Write-Host "Prepared release artifacts in $DistDir:"
           Get-ChildItem -Path $DistDir | Select-Object Name, Length
