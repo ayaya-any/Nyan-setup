@@ -41,25 +41,26 @@ jobs:
           # 1. Copy standalone Nyan Setup Studio & CLI binary
           $ExeDist = Join-Path $DistDir "nyan-setup.exe"
           Copy-Item -Path "target/release/nyan-setup.exe" -Destination $ExeDist
-          $ExeDistResolved = (Resolve-Path $ExeDist).Path
 
           # 2. Generate a template package.sample.json configuration file
           $ConfigSample = Join-Path $DistDir "package.sample.json"
-          Start-Process -FilePath $ExeDistResolved -ArgumentList "init-config", $ConfigSample -NoNewWindow -Wait
+          & "target/release/nyan-setup.exe" init-config $ConfigSample | Out-Default
 
           # 3. Build a standalone demo installer Setup executable
           $DemoInstaller = Join-Path $DistDir "NyanStudioApp_Demo_Setup.exe"
-          Start-Process -FilePath $ExeDistResolved -ArgumentList "build-demo", $DemoInstaller -NoNewWindow -Wait
+          & "target/release/nyan-setup.exe" build-demo $DemoInstaller | Out-Default
 
           # 4. Pack a ZIP archive bundle containing executable, config template, and docs
           $ZipBundle = Join-Path $DistDir "nyan-setup-$Tag-windows-x86_64.zip"
           $StageDir = Join-Path $DistDir "bundle_staging"
           New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
           Copy-Item -Path $ExeDist -Destination $StageDir
-          Copy-Item -Path $ConfigSample -Destination $StageDir
+          if (Test-Path $ConfigSample) {
+            Copy-Item -Path $ConfigSample -Destination $StageDir
+          }
           Copy-Item -Path "README.md" -Destination $StageDir
           Copy-Item -Path "docs" -Destination $StageDir -Recurse
-          Compress-Archive -Path "$StageDir/*" -DestinationPath $ZipBundle -Force
+          Get-ChildItem -Path $StageDir | Compress-Archive -DestinationPath $ZipBundle -Force
           Remove-Item -Recurse -Force $StageDir
 
           # 5. Generate SHA256 checksums for all release assets
