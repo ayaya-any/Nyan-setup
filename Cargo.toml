@@ -1,6 +1,6 @@
 [package]
 name = "nyan-setup"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Material Design Installer Builder & Self-Extracting Setup Wizard powered by Rust + Win32 Direct2D (Static CRT)"
 authors = ["Nyan Setup Team"]

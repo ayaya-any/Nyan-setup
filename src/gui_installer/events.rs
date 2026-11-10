@@ -267,7 +267,7 @@ impl InstallerWindowState {
                             let target_dir = PathBuf::from(&self.install_dir_input);
                             let main_exe = target_dir.join(&manifest.config.main_exe);
                             if main_exe.exists() {
-                                shell_open(&main_exe, Some("--demo-app"), Some(&target_dir));
+                                shell_open(&main_exe, None, Some(&target_dir));
                             }
                         }
                     }
