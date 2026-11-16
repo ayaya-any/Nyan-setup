@@ -228,13 +228,14 @@ impl StudioWindowState {
                 let left_w = 304.0;
                 let right_x = x0 + left_w + 20.0;
                 let right_w = w_full - left_w - 20.0;
-                let c1 = RectF::new(x0, card.y + 108.0, left_w, 42.0);
-                let c2 = RectF::new(x0, card.y + 152.0, left_w, 42.0);
-                let c3 = RectF::new(x0, card.y + 196.0, left_w, 42.0);
-                let c4 = RectF::new(x0, card.y + 240.0, left_w, 42.0);
+                let c1 = RectF::new(x0, card.y + 104.0, left_w, 38.0);
+                let c2 = RectF::new(x0, card.y + 144.0, left_w, 38.0);
+                let c3 = RectF::new(x0, card.y + 184.0, left_w, 38.0);
+                let c4 = RectF::new(x0, card.y + 224.0, left_w, 38.0);
                 let pol_w = (left_w - 8.0) * 0.5;
-                let btn_pol_auto = RectF::new(x0, card.y + 316.0, pol_w, 34.0);
-                let btn_pol_prompt = RectF::new(x0 + pol_w + 8.0, card.y + 316.0, pol_w, 34.0);
+                let btn_pol_auto = RectF::new(x0, card.y + 290.0, pol_w, 32.0);
+                let btn_pol_prompt = RectF::new(x0 + pol_w + 8.0, card.y + 290.0, pol_w, 32.0);
+                let r_services = RectF::new(x0, card.y + 442.0, left_w, 36.0);
 
                 if c1.contains(x, y) {
                     self.config.create_desktop_shortcut = !self.config.create_desktop_shortcut;
@@ -253,13 +254,16 @@ impl StudioWindowState {
                     self.config.process_conflict_policy = ProcessConflictPolicy::PromptUser;
                     self.config.kill_process_on_update = false;
                     self.add_ripple(x, y, btn_pol_prompt, rgba(0xFFFFFF, 0.25));
+                } else if r_services.contains(x, y) {
+                    self.focused_field = prev_focus;
+                    self.click_text_field(FocusedField::Services, r_services, x);
                 }
 
                 let levels = [1u32, 6u32, 9u32];
                 let seg_w = (left_w - 16.0) / 3.0;
                 for (i, lv) in levels.iter().enumerate() {
                     let sr =
-                        RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 408.0, seg_w, 36.0);
+                        RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 370.0, seg_w, 34.0);
                     if sr.contains(x, y) {
                         self.config.compression_level = *lv;
                     }
@@ -530,6 +534,7 @@ impl StudioWindowState {
                     FocusedField::PrereqExpected => FocusedField::PrereqActionPrimary,
                     FocusedField::PrereqActionPrimary => FocusedField::PrereqActionSecondary,
                     FocusedField::PrereqActionSecondary => FocusedField::PrereqName,
+                    FocusedField::Services => FocusedField::Services,
                     FocusedField::None => FocusedField::None,
                 };
                 if let Some(val) = self.field_value_ref(self.focused_field).map(str::to_string) {

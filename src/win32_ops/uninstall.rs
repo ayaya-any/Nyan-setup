@@ -191,6 +191,7 @@ pub fn remove_uninstall_entry(app_id: &str) {
         desktop_shortcut: None,
         start_menu_shortcut: None,
         registry_key_created: true,
+        services: Vec::new(),
     };
     let _ = clean_all_application_registry_residue(&dummy_receipt);
 }
@@ -285,7 +286,17 @@ pub fn execute_uninstall_steps(receipt: &UninstallReceipt) -> Vec<String> {
     let mut logs = Vec::new();
     let install_dir = PathBuf::from(&receipt.install_dir);
 
-    // 0. Terminate any running application processes in `install_dir` so `.exe`/`.dll` files are not locked
+    // 0.a Stop and delete any associated Windows Services (auto-discovered in `install_dir` + explicit `receipt.services`)
+    let svc_logs = super::service::stop_and_delete_application_services(
+        &install_dir,
+        &receipt.installed_files,
+        &receipt.services,
+    );
+    for l in svc_logs {
+        logs.push(l);
+    }
+
+    // 0.b Terminate any running application processes in `install_dir` so `.exe`/`.dll` files are not locked
     let exe_files: Vec<String> = receipt
         .installed_files
         .iter()

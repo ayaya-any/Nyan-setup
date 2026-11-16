@@ -699,7 +699,7 @@ impl StudioWindowState {
             false,
         );
 
-        let c1 = RectF::new(x0, card.y + 108.0, left_w, 42.0);
+        let c1 = RectF::new(x0, card.y + 104.0, left_w, 38.0);
         self.renderer.draw_checkbox(
             c1,
             self.config.create_desktop_shortcut,
@@ -709,7 +709,7 @@ impl StudioWindowState {
             &pal,
         );
 
-        let c2 = RectF::new(x0, card.y + 152.0, left_w, 42.0);
+        let c2 = RectF::new(x0, card.y + 144.0, left_w, 38.0);
         self.renderer.draw_checkbox(
             c2,
             self.config.create_start_menu_shortcut,
@@ -719,7 +719,7 @@ impl StudioWindowState {
             &pal,
         );
 
-        let c3 = RectF::new(x0, card.y + 196.0, left_w, 42.0);
+        let c3 = RectF::new(x0, card.y + 184.0, left_w, 38.0);
         self.renderer.draw_checkbox(
             c3,
             self.config.register_uninstaller,
@@ -729,7 +729,7 @@ impl StudioWindowState {
             &pal,
         );
 
-        let c4 = RectF::new(x0, card.y + 240.0, left_w, 42.0);
+        let c4 = RectF::new(x0, card.y + 224.0, left_w, 38.0);
         self.renderer.draw_checkbox(
             c4,
             self.config.auto_launch_after_install,
@@ -739,11 +739,11 @@ impl StudioWindowState {
             &pal,
         );
 
-        // Process Conflict Policy Selector (y = card.y + 292..374)
+        // Process Conflict Policy Selector (y = card.y + 268..344)
         self.renderer.draw_text(
-            "安装/更新时进程占用处理策略",
+            "安装/更新时进程与服务占用策略",
             &self.renderer.font_body_bold,
-            RectF::new(x0 + 4.0, card.y + 292.0, left_w, 20.0),
+            RectF::new(x0 + 4.0, card.y + 268.0, left_w, 20.0),
             pal.text_primary,
             0,
             1,
@@ -751,8 +751,8 @@ impl StudioWindowState {
         );
 
         let pol_w = (left_w - 8.0) * 0.5;
-        let btn_pol_auto = RectF::new(x0, card.y + 316.0, pol_w, 34.0);
-        let btn_pol_prompt = RectF::new(x0 + pol_w + 8.0, card.y + 316.0, pol_w, 34.0);
+        let btn_pol_auto = RectF::new(x0, card.y + 290.0, pol_w, 32.0);
+        let btn_pol_prompt = RectF::new(x0 + pol_w + 8.0, card.y + 290.0, pol_w, 32.0);
         self.renderer.draw_button(
             btn_pol_auto,
             "自动结束占用进程",
@@ -782,26 +782,26 @@ impl StudioWindowState {
             &self.ripples,
         );
         let pol_hint = match self.config.process_conflict_policy {
-            ProcessConflictPolicy::AutoKill => "检测到目标程序运行时，自动静默结束进程并继续安装",
+            ProcessConflictPolicy::AutoKill => "更新时自动停止关联系统服务与运行进程，覆盖后恢复启动服务",
             ProcessConflictPolicy::PromptUser => {
-                "检测到占用时弹窗列出运行进程，提供“重试”与“结束进程并重试”"
+                "检测到占用时弹窗列出运行进程与服务，提供“重试”与“结束并重试”"
             }
         };
         self.renderer.draw_text(
             pol_hint,
             &self.renderer.font_caption,
-            RectF::new(x0 + 4.0, card.y + 354.0, left_w, 18.0),
+            RectF::new(x0 + 4.0, card.y + 325.0, left_w, 18.0),
             pal.text_secondary,
             0,
             1,
             false,
         );
 
-        // Compression Level Selector (y = card.y + 382..444)
+        // Compression Level Selector (y = card.y + 348..406)
         self.renderer.draw_text(
             "LZMA2 固实压缩 + x86 BCJ 字典等级",
             &self.renderer.font_body_bold,
-            RectF::new(x0 + 4.0, card.y + 382.0, left_w, 20.0),
+            RectF::new(x0 + 4.0, card.y + 348.0, left_w, 20.0),
             pal.text_primary,
             0,
             1,
@@ -811,7 +811,7 @@ impl StudioWindowState {
         let levels = [(1u32, "快速 (Lv.1)"), (6u32, "标准 (Lv.6)"), (9u32, "极限 (Lv.9)")];
         let seg_w = (left_w - 16.0) / 3.0;
         for (i, (lv, label)) in levels.iter().enumerate() {
-            let sr = RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 408.0, seg_w, 36.0);
+            let sr = RectF::new(x0 + (i as f32) * (seg_w + 8.0), card.y + 370.0, seg_w, 34.0);
             let variant = if self.config.compression_level == *lv {
                 ButtonVariant::Filled
             } else {
@@ -828,6 +828,19 @@ impl StudioWindowState {
                 &self.ripples,
             );
         }
+
+        // Optional Associated Windows Services field (y = card.y + 442..478)
+        let r_services = RectF::new(x0, card.y + 442.0, left_w, 36.0);
+        self.renderer.draw_text_field_with_sel(
+            r_services,
+            "关联服务名 (可选逗号分隔，留空自动按安装目录识别)",
+            &self.services_input,
+            self.focused_field == FocusedField::Services,
+            r_services.contains(mx, my),
+            self.caret_visible,
+            &self.text_input,
+            &pal,
+        );
 
         // Right column: License Agreement Preview & Import
         self.renderer.draw_text(

@@ -94,6 +94,7 @@ my-project/
   "register_uninstaller": true,
   "auto_launch_after_install": true,
   "process_conflict_policy": "prompt_user",
+  "services": ["MyAppDaemonSvc"],
   "license_text": "终端用户软件许可协议 (EULA)\n\n1. 许可授予\n...",
   "prerequisites": [
     {
@@ -139,7 +140,8 @@ my-project/
 | `create_start_menu_shortcut` | `boolean` | 否 | `true` | 安装向导中“在开始菜单创建快捷方式”选项的默认勾选状态。 |
 | `register_uninstaller` | `boolean` | 否 | `true` | 是否默认生成 `unins000.exe` 并注册到 Windows“应用和功能”列表。 |
 | `auto_launch_after_install` | `boolean` | 否 | `true` | 安装完成页中“立即运行主程序”选项的默认勾选状态。 |
-| `process_conflict_policy` | `string` | 否 | `"auto_kill"` | **安装/更新时检测到目标目录文件被进程占用时的处理策略**：<br>• `"auto_kill"`：安装前自动终止占用进程并继续安装；<br>• `"prompt_user"`：弹出模态提示窗口列出占用进程名与 `PID`，由用户选择「重试」或「结束进程并重试」。 |
+| `process_conflict_policy` | `string` | 否 | `"auto_kill"` | **安装/更新时检测到目标目录文件被进程占用时的处理策略**：<br>• `"auto_kill"`：安装前自动停止关联服务、终止占用进程并继续安装，更新后自动恢复服务；<br>• `"prompt_user"`：弹出模态提示窗口列出占用进程名与 `PID`（及服务标识），由用户选择「重试」或「结束进程并重试」。 |
+| `services` | `array<string>` | 否 | `[]` | **关联的 Windows 系统服务名称列表**（如 `["MyAppService"]`）。<br>• **零配置自动识别**：即使留空 `[]`，在覆盖更新和卸载时也会通过注册表 `Services\<Name>\ImagePath`（含 NSSM `Parameters\Application`）及 Windows Restart Manager (`RmService`) 自动发现所有归属安装目录的系统服务；<br>• **更新时**：自动停止运行中的关联服务 → 覆盖文件 → 自动恢复启动服务；<br>• **卸载时**：自动停止服务并等待 `SERVICE_STOPPED` → 调用 `DeleteService` 注销删除服务（非管理员运行遇系统服务时将按需请求 UAC 提权）。 |
 | `license_text` | `string` | 否 | 内置标准 EULA | 安装向导第 1 步展示的《软件许可协议》正文（支持 `\n` 换行）。 |
 | `prerequisites` | `array` | 否 | `[]` | 前置运行环境检测与自动部署规则列表（详见第四节）。 |
 
@@ -258,7 +260,43 @@ my-project/
 
 ---
 
-## 五、CI/CD 自动化构建与校验示例
+## 五、Windows 系统服务自动管理与配置说明
+
+当应用程序包含 Windows 后台系统服务（無論是在安装阶段通过 `prerequisites` 的 `run_command` 注册，还是应用程序运行后自行向系统注册）时，Nyan Setup 采用**“零配置自动识别 + 可选显式声明 + 按需 UAC 提权”**机制：
+
+### 5.1 零配置自动识别机制（推荐）
+
+即使在 `package.json` 中省略 `services`（或保持 `"services": []`），安装器与卸载器也会通过以下双重机制自动发现归属当前应用的系统服务：
+
+1. **注册表 `Services` 路径反查**：
+   在通过安全应用目录校验的前提下，自动扫描 `HKLM\SYSTEM\CurrentControlSet\Services` 下的 Win32 服务（排除底层内核驱动），凡是 `ImagePath`（或 NSSM / `srvany` 包装器的 `Parameters\Application`、`Parameters\AppDirectory`）指向当前安装目录 `install_dir` 内部的服务，均会被自动识别。
+2. **Windows Restart Manager (`Rstrtmgr.dll`) 实时锁检测**：
+   当目录下的 `.exe` 或 `.dll` 被运行中的服务锁定时，Restart Manager 会直接识别出 `RmService` 并提取其系统服务短名称（`strServiceShortName`）。
+
+### 5.2 显式声明服务名称（可选兜底）
+
+若您的服务托管在系统公共宿主（如 `svchost.exe`）中且注册表路径未指向应用安装目录，可在 `package.json` 顶层显式声明服务名列表：
+
+```json
+"services": ["MyAppDaemonSvc", "MyAppUpdaterSvc"]
+```
+
+### 5.3 覆盖更新与卸载时的执行流程
+
+- **覆盖更新（Update）**：
+  1. **更新前**：自动识别关联服务并记录当前处于运行状态的服务列表，随后向 SCM 发送 `SERVICE_CONTROL_STOP` 并轮询等待状态进入 `SERVICE_STOPPED`（彻底释放文件占用锁）；
+  2. **更新中**：解压并覆写新版文件；
+  3. **更新后**：自动调用 `StartServiceW` 将更新前正在运行的服务恢复启动。
+- **卸载清理（Uninstall）**：
+  1. 自动汇总卸载清单（`unins000.dat`）记录的服务与实时扫描安装目录发现的服务；
+  2. 先停止服务并等待完全退出（`SERVICE_STOPPED`），再调用 Win32 `DeleteService` 将服务从 SCM 中彻底注销，并清理残留注册表项；
+  3. 最后执行常规进程清理与安装目录删除。
+- **按需静默 UAC 提权**：
+  普通无服务应用全程无需 UAC 提权；仅当检测到存在关联系统服务需停止/启动/删除且当前安装器或卸载器未以管理员权限运行时，会自动通过 `--service-op` 请求一次后台 UAC 授权完成服务操作，无需关闭或重启当前向导窗口。
+
+---
+
+## 六、CI/CD 自动化构建与校验示例
 
 在 GitHub Actions 或本地自动化构建脚本（PowerShell）中，可以结合 `pack --config` 与 `--extract-to` 实现从打包到完整性验证的全流程自动化：
 

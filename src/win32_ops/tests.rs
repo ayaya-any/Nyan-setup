@@ -192,6 +192,7 @@ fn test_deep_registry_cleanup() {
         desktop_shortcut: None,
         start_menu_shortcut: None,
         registry_key_created: true,
+        services: Vec::new(),
     };
 
     let logs = clean_all_application_registry_residue(&receipt);
@@ -314,6 +315,7 @@ fn test_tileproperties_exact_user_path_cleaned() {
         desktop_shortcut: None,
         start_menu_shortcut: None,
         registry_key_created: false,
+        services: Vec::new(),
     };
 
     let logs = clean_all_application_registry_residue(&receipt);
@@ -647,4 +649,192 @@ fn test_process_conflict_detection_no_false_positive_and_restart_manager_lock() 
         "Once handle is closed, file must no longer be reported locked"
     );
     let _ = fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_service_discovery_and_image_path_matching() {
+    let dir_norm = r"c:\program files\nyan studio app";
+    let dir_prefix = r"c:\program files\nyan studio app\";
+
+    assert!(image_path_matches_install_dir(
+        r#""C:\Program Files\Nyan Studio App\bin\NyanSvc.exe" --service"#,
+        dir_norm,
+        dir_prefix
+    ));
+    assert!(image_path_matches_install_dir(
+        r"C:\Program Files\Nyan Studio App\NyanSvc.exe",
+        dir_norm,
+        dir_prefix
+    ));
+    assert!(image_path_matches_install_dir(
+        r#""C:\Tools\nssm.exe" "C:\Program Files\Nyan Studio App\worker.exe""#,
+        dir_norm,
+        dir_prefix
+    ));
+    assert!(!image_path_matches_install_dir(
+        r#""C:\Program Files\Nyan Studio App Other\NyanSvc.exe""#,
+        dir_norm,
+        dir_prefix
+    ));
+    assert!(!image_path_matches_install_dir(
+        r"C:\Windows\System32\svchost.exe -k netsvcs",
+        dir_norm,
+        dir_prefix
+    ));
+
+    // Create a mock Services registry tree under HKCU to verify `scan_services_in_registry_key`
+    let mock_services_base = format!(
+        "Software\\NyanSetupMockServices_{}",
+        unsafe { GetCurrentProcessId() }
+    );
+    let app_install_dir = Path::new(r"C:\Program Files\Nyan Studio App");
+
+    let create_mock_service =
+        |svc_name: &str, svc_type: u32, image_path: &str, nssm_app: Option<&str>| {
+            let key_path = format!("{}\\{}", mock_services_base, svc_name);
+            let key_w = to_wide(&key_path);
+            unsafe {
+                let mut h_svc = HKEY::default();
+                let res = RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(key_w.as_ptr()),
+                    0,
+                    PCWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_WRITE,
+                    None,
+                    &mut h_svc,
+                    None,
+                );
+                assert!(res.is_ok());
+
+                let type_name = to_wide("Type");
+                let _ = RegSetValueExW(
+                    h_svc,
+                    PCWSTR(type_name.as_ptr()),
+                    0,
+                    REG_DWORD,
+                    Some(&svc_type.to_le_bytes()),
+                );
+
+                let img_name = to_wide("ImagePath");
+                let img_w = to_wide(image_path);
+                let _ = RegSetValueExW(
+                    h_svc,
+                    PCWSTR(img_name.as_ptr()),
+                    0,
+                    REG_SZ,
+                    Some(std::slice::from_raw_parts(
+                        img_w.as_ptr() as *const u8,
+                        img_w.len() * 2,
+                    )),
+                );
+
+                if let Some(app_str) = nssm_app {
+                    let param_w = to_wide("Parameters");
+                    let mut h_param = HKEY::default();
+                    if RegCreateKeyExW(
+                        h_svc,
+                        PCWSTR(param_w.as_ptr()),
+                        0,
+                        PCWSTR::null(),
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_WRITE,
+                        None,
+                        &mut h_param,
+                        None,
+                    )
+                    .is_ok()
+                    {
+                        let app_val_name = to_wide("Application");
+                        let app_val_w = to_wide(app_str);
+                        let _ = RegSetValueExW(
+                            h_param,
+                            PCWSTR(app_val_name.as_ptr()),
+                            0,
+                            REG_SZ,
+                            Some(std::slice::from_raw_parts(
+                                app_val_w.as_ptr() as *const u8,
+                                app_val_w.len() * 2,
+                            )),
+                        );
+                        let _ = RegCloseKey(h_param);
+                    }
+                }
+
+                let _ = RegCloseKey(h_svc);
+            }
+        };
+
+    // 1. Direct Win32 service (Type 0x10) inside install_dir
+    create_mock_service(
+        "NyanMainSvc",
+        0x10,
+        r#""C:\Program Files\Nyan Studio App\NyanSvc.exe" --run"#,
+        None,
+    );
+    // 2. NSSM wrapped service (Type 0x10) with Parameters\Application inside install_dir
+    create_mock_service(
+        "NyanNssmWrapperSvc",
+        0x10,
+        r"C:\Tools\nssm\nssm.exe",
+        Some(r"C:\Program Files\Nyan Studio App\bin\worker.exe"),
+    );
+    // 3. Kernel driver (Type 0x01) -> should be ignored by Win32 service filter
+    create_mock_service(
+        "NyanKernelDrv",
+        0x01,
+        r"\??\C:\Program Files\Nyan Studio App\drv.sys",
+        None,
+    );
+    // 4. Unrelated service in another folder
+    create_mock_service(
+        "OtherVendorSvc",
+        0x20,
+        r#""C:\Program Files\OtherApp\svc.exe""#,
+        None,
+    );
+
+    let found_svcs = scan_services_in_registry_key(
+        HKEY_CURRENT_USER,
+        &mock_services_base,
+        app_install_dir,
+    );
+    assert!(
+        found_svcs.contains(&"NyanMainSvc".to_string()),
+        "Should detect direct Win32 service in install_dir: {:?}",
+        found_svcs
+    );
+    assert!(
+        found_svcs.contains(&"NyanNssmWrapperSvc".to_string()),
+        "Should detect NSSM wrapper service in install_dir: {:?}",
+        found_svcs
+    );
+    assert!(
+        !found_svcs.contains(&"NyanKernelDrv".to_string()),
+        "Should ignore kernel driver Type=0x01: {:?}",
+        found_svcs
+    );
+    assert!(
+        !found_svcs.contains(&"OtherVendorSvc".to_string()),
+        "Should not match unrelated service: {:?}",
+        found_svcs
+    );
+
+    // Unsafe root directory must never return any matched services
+    let unsafe_found = scan_services_in_registry_key(
+        HKEY_CURRENT_USER,
+        &mock_services_base,
+        Path::new(r"C:\Program Files"),
+    );
+    assert!(
+        unsafe_found.is_empty(),
+        "Unsafe root directory must never auto-match services"
+    );
+
+    unsafe {
+        let base_w = to_wide(&mock_services_base);
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(base_w.as_ptr()));
+        let _ = RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(base_w.as_ptr()));
+    }
 }

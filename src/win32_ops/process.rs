@@ -250,7 +250,17 @@ pub(crate) fn query_restart_manager_locking_processes(
                     if pid == 0 || pid == 4 || pid == self_pid {
                         continue;
                     }
-                    let exe_name = if let Some(full_path) = query_process_full_path(pid) {
+                    let svc_end = info
+                        .str_service_short_name
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(info.str_service_short_name.len());
+                    let svc_short =
+                        String::from_utf16_lossy(&info.str_service_short_name[..svc_end])
+                            .trim()
+                            .to_string();
+
+                    let mut exe_name = if let Some(full_path) = query_process_full_path(pid) {
                         Path::new(&full_path)
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
@@ -268,6 +278,9 @@ pub(crate) fn query_restart_manager_locking_processes(
                             app_str
                         }
                     };
+                    if !svc_short.is_empty() {
+                        exe_name = format!("{} [服务: {}]", exe_name, svc_short);
+                    }
                     if !results.iter().any(|(p, _)| *p == pid) {
                         results.push((pid, exe_name));
                     }
@@ -279,6 +292,93 @@ pub(crate) fn query_restart_manager_locking_processes(
     }
 
     results
+}
+
+/// Query Windows Restart Manager (`Rstrtmgr.dll`) for any Windows Service short names (`RmService` / `strServiceShortName`)
+/// holding locks on files inside `target_install_dir`.
+pub(crate) fn query_restart_manager_locking_services(
+    target_install_dir: &Path,
+    candidate_files: &[String],
+) -> Vec<String> {
+    let mut services = Vec::new();
+    let locked_files = collect_locked_files_in_dir(target_install_dir, candidate_files);
+    if locked_files.is_empty() {
+        return services;
+    }
+
+    let wide_paths: Vec<Vec<u16>> = locked_files
+        .iter()
+        .map(|p| to_wide(&p.to_string_lossy()))
+        .collect();
+    let ptrs: Vec<*const u16> = wide_paths.iter().map(|w| w.as_ptr()).collect();
+
+    unsafe {
+        let mut session: u32 = 0;
+        let mut session_key = [0u16; 64];
+        if RmStartSession(&mut session, 0, session_key.as_mut_ptr()) != 0 {
+            return services;
+        }
+
+        if RmRegisterResources(
+            session,
+            ptrs.len() as u32,
+            ptrs.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        ) == 0
+        {
+            let mut needed: u32 = 0;
+            let mut count: u32 = 16;
+            let mut reboot_reasons: u32 = 0;
+            let mut infos = vec![RmProcessInfo::default(); count as usize];
+
+            let mut status = RmGetList(
+                session,
+                &mut needed,
+                &mut count,
+                infos.as_mut_ptr(),
+                &mut reboot_reasons,
+            );
+            if status == 234 && needed > count {
+                count = needed;
+                infos.resize(count as usize, RmProcessInfo::default());
+                status = RmGetList(
+                    session,
+                    &mut needed,
+                    &mut count,
+                    infos.as_mut_ptr(),
+                    &mut reboot_reasons,
+                );
+            }
+
+            if status == 0 {
+                for info in infos.iter().take(count as usize) {
+                    let svc_end = info
+                        .str_service_short_name
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(info.str_service_short_name.len());
+                    let svc_short =
+                        String::from_utf16_lossy(&info.str_service_short_name[..svc_end])
+                            .trim()
+                            .to_string();
+                    if !svc_short.is_empty()
+                        && !services
+                            .iter()
+                            .any(|s: &String| s.eq_ignore_ascii_case(&svc_short))
+                    {
+                        services.push(svc_short);
+                    }
+                }
+            }
+        }
+
+        let _ = RmEndSession(session);
+    }
+
+    services
 }
 
 /// Find running processes that actually occupy `target_install_dir`:
@@ -375,6 +475,21 @@ pub fn find_running_target_processes(
         let _ = CloseHandle(snapshot);
     }
 
+    // 3. Also check SCM for any running Windows Services registered inside `target_install_dir`
+    for svc in super::service::find_services_in_install_dir(target_install_dir) {
+        if let Some((state, pid)) = super::service::query_service_state(&svc) {
+            if state != super::service::SERVICE_STOPPED && pid != 0 && pid != 4 && pid != self_pid {
+                if let Some((_, existing_name)) = found.iter_mut().find(|(p, _)| *p == pid) {
+                    if !existing_name.contains(&svc) {
+                        *existing_name = format!("{} [服务: {}]", existing_name, svc);
+                    }
+                } else {
+                    found.push((pid, format!("{} [系统服务]", svc)));
+                }
+            }
+        }
+    }
+
     found
 }
 
@@ -383,8 +498,11 @@ pub fn terminate_running_target_processes(
     target_install_dir: &Path,
     exe_names: &[String],
 ) -> Vec<String> {
-    let targets = find_running_target_processes(target_install_dir, exe_names);
     let mut logs = Vec::new();
+    let (_, svc_logs) = super::service::stop_services_for_update(target_install_dir, exe_names, &[]);
+    logs.extend(svc_logs);
+
+    let targets = find_running_target_processes(target_install_dir, exe_names);
     let mut killed_any = false;
 
     for (pid, exe_name) in targets {

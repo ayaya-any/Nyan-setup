@@ -85,7 +85,20 @@ pub fn extract_package_files(
         candidate_files.push(manifest.config.main_exe.clone());
     }
 
+    let mut services_to_restart = Vec::new();
     if kill_locked_processes {
+        let (stopped_svcs, svc_msgs) = crate::win32_ops::stop_services_for_update(
+            target_install_dir,
+            &candidate_files,
+            &manifest.config.services,
+        );
+        services_to_restart = stopped_svcs;
+        if let Some(tx) = progress_tx {
+            for msg in svc_msgs {
+                let _ = tx.send(InstallProgressEvent::KillingProcesses(msg));
+            }
+        }
+
         let killed_msgs = crate::win32_ops::terminate_running_target_processes(
             target_install_dir,
             &candidate_files,
@@ -295,6 +308,15 @@ pub fn extract_package_files(
                 }
             }
             PrereqAction::PromptAndAbort { .. } => {}
+        }
+    }
+
+    if !services_to_restart.is_empty() {
+        let restart_msgs = crate::win32_ops::restart_services_after_update(&services_to_restart);
+        if let Some(tx) = progress_tx {
+            for msg in restart_msgs {
+                let _ = tx.send(InstallProgressEvent::KillingProcesses(msg));
+            }
         }
     }
 

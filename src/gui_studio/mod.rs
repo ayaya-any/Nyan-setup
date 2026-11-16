@@ -48,6 +48,7 @@ pub enum FocusedField {
     SourceDir,
     DefaultInstallDir,
     OutputExe,
+    Services,
     PrereqName,
     PrereqTarget,
     PrereqValueName,
@@ -86,6 +87,7 @@ pub struct StudioWindowState {
     pub source_dir: String,
     pub output_exe: String,
     pub installer_icon_input: String,
+    pub services_input: String,
     pub selected_prereq_idx: usize,
 
     // Scanned source directory preview
@@ -129,6 +131,7 @@ impl StudioWindowState {
             source_dir: default_src.to_string_lossy().to_string(),
             output_exe: default_out.to_string_lossy().to_string(),
             installer_icon_input: String::new(),
+            services_input: String::new(),
             selected_prereq_idx: 0,
             scanned_files: Vec::new(),
             scanned_total_bytes: 0,
@@ -216,6 +219,7 @@ impl StudioWindowState {
             FocusedField::SourceDir => Some(&self.source_dir),
             FocusedField::DefaultInstallDir => Some(&self.config.default_install_dir),
             FocusedField::OutputExe => Some(&self.output_exe),
+            FocusedField::Services => Some(&self.services_input),
             FocusedField::PrereqName => self
                 .config
                 .prerequisites
@@ -300,6 +304,7 @@ impl StudioWindowState {
                 Some(RectF::new(x0, card.y + 180.0, w_full - 246.0, 38.0))
             }
             FocusedField::OutputExe => Some(RectF::new(x0, card.y + 248.0, w_full - 138.0, 38.0)),
+            FocusedField::Services => Some(RectF::new(x0, card.y + 442.0, 304.0, 36.0)),
             FocusedField::PrereqName => Some(RectF::new(ex, card.y + 152.0, ew - 178.0, 34.0)),
             FocusedField::PrereqTarget => {
                 let rule = self.config.prerequisites.get(idx)?;
@@ -391,6 +396,7 @@ impl StudioWindowState {
             FocusedField::SourceDir => Some(&mut self.source_dir),
             FocusedField::DefaultInstallDir => Some(&mut self.config.default_install_dir),
             FocusedField::OutputExe => Some(&mut self.output_exe),
+            FocusedField::Services => Some(&mut self.services_input),
             FocusedField::PrereqName => self
                 .config
                 .prerequisites
@@ -471,6 +477,14 @@ impl StudioWindowState {
         } else {
             Some(self.installer_icon_input.trim().to_string())
         };
+        if !self.services_input.trim().is_empty() {
+            cfg.services = self
+                .services_input
+                .split([',', ';'])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         let hwnd_raw = self.hwnd.0 as isize;
 
         let (tx, rx) = mpsc::channel();

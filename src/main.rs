@@ -82,6 +82,11 @@ fn main() {
     enable_high_dpi();
 
     let args: Vec<String> = env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("--service-op") {
+        let code = crate::win32_ops::run_cli_service_op(&args[2..]);
+        std::process::exit(code);
+    }
+
     let current_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("nyan-setup.exe"));
 
     // Check if running as the installed demo application (`NyanApp.exe` or `--demo-app`)

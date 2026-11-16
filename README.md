@@ -10,8 +10,11 @@
 - **单执行文件架构**：安装包采用自解压 Stub + 固实压缩流 + 尾部清单架构，单个可执行文件即可独立运行。
 - **PE 资源动态注入**：支持打包时指定自定义 `.ico` 图标，自动通过 Windows UpdateResource API 重构替换 PE 内部图标资源。
 - **前置环境检测与部署**：支持在打包时声明注册表键值检测（`HKLM` / `HKCU` / `HKCR` / `HKU`、32/64 位视图）或系统文件及 PE 版本（`VS_FIXEDFILEINFO`）校验规则；条件不满足时可自动解压并静默执行随包附带的运行库（如 `vc_redist.x64.exe`）、运行自定义命令或弹窗提示。
+- **进程冲突检测与 Windows 系统服务联动**：
+  - 集成 Windows Restart Manager (`Rstrtmgr.dll`) 与句柄锁检测，精准定位占用目标目录 `.exe` / `.dll` 的进程与服务，支持打包配置 `auto_kill`（自动结束占用进程）或 `prompt_user`（弹出交互式占用提示窗）；
+  - **Windows 服务全生命周期管理**：自动扫描 `HKLM\SYSTEM\CurrentControlSet\Services` 中 `ImagePath`（及 NSSM `Parameters\Application`）指向安装目录的系统服务，并支持在配置中显式声明 `services`；覆盖更新时自动停止运行中的服务、覆写文件后恢复启动；卸载时自动停止服务并调用 `DeleteService` 彻底注销，非管理员运行时支持按需请求 UAC 提权。
 - **深度卸载清理**：
-  - 自动检测并安全终止安装目录内运行的目标进程；
+  - 自动停止并删除关联系统服务，安全终止安装目录内运行的目标进程；
   - 递归清理文件与空子目录，结合安全目录校验机制自销毁安装根目录；
   - 彻底清理系统注册表残留，覆盖应用卸载项、App Paths、开始菜单磁贴属性树（TileProperties）、音量合成器缓存（Audio PolicyConfig）、MuiCache、自启动与启动任务管理项等。
 
@@ -44,10 +47,13 @@ cargo test --release
 
 ### 2. 命令行打包
 
-使用 `pack` 子命令通过 JSON 配置文件进行自动化打包：
+使用 `init-config` 生成模板配置，并通过 `pack` 子命令执行自动化打包（详细字段说明请参考 [命令行配置文件打包操作文档](docs/CLI_PACKAGING_GUIDE.md)）：
 
 ```powershell
-# 使用默认图标打包
+# 生成模板配置文件 package.json
+nyan-setup.exe init-config package.json
+
+# 使用配置文件打包
 nyan-setup.exe pack --config package.json
 
 # 指定自定义图标打包
@@ -68,6 +74,8 @@ nyan-setup.exe pack --config package.json --icon resources\app.ico
   "output_exe": "./dist/ExampleApp_Setup.exe",
   "create_desktop_shortcut": true,
   "create_start_menu_shortcut": true,
+  "process_conflict_policy": "auto_kill",
+  "services": [],
   "prerequisites": [
     {
       "name": "Microsoft VC++ 2015-2022 运行库 (x64)",
@@ -109,18 +117,17 @@ cargo run --release -- build-demo
 ```text
 Nyan-setup/
 ├── .cargo/               # 编译器静态链接配置 (+crt-static)
-├── resources/            # 应用程序资源
-│   ├── app.ico           # 多尺寸图标文件
-│   ├── app.rc            # Windows PE 资源脚本
-│   └── icons/            # SVG 矢量源及各尺寸 PNG 资源
+├── docs/                 # 详细打包与命令行配置操作指南
+├── resources/            # 应用程序图标与 PE 资源脚本
 ├── src/
-│   ├── main.rs           # 程序入口与 CLI 分发
-│   ├── d2d.rs            # Direct2D / DirectWrite UI 渲染引擎
+│   ├── main.rs           # 程序主入口与运行模式路由
+│   ├── cli.rs            # 命令行子命令实现 (init-config, pack, build-demo)
 │   ├── icon.rs           # ICO 格式解析与 PE 资源动态替换
-│   ├── package.rs        # Solid LZMA2 + BCJ 压缩归档引擎
-│   ├── gui_installer.rs  # 安装器向导与卸载器向导 UI
-│   ├── gui_studio.rs     # 可视化 Studio 打包设计器
-│   └── win32_ops.rs      # Win32 系统接口、进程管理与注册表清理
+│   ├── d2d/              # Direct2D / DirectWrite 渲染引擎、配色与通用控件
+│   ├── package/          # Solid LZMA2 + BCJ 固实压缩与流式解包引擎
+│   ├── gui_installer/    # 安装器向导与卸载器向导 GUI
+│   ├── gui_studio/       # 可视化 Studio 打包设计器 GUI
+│   └── win32_ops/        # Win32 系统接口、SCM 服务管理、进程检测与注册表清理
 ├── build.rs              # Windows 资源编译脚本
 └── Cargo.toml            # 项目配置与依赖定义
 ```

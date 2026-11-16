@@ -1,6 +1,7 @@
 pub mod prereq;
 pub mod process;
 pub mod registry_clean;
+pub mod service;
 pub mod shell;
 pub mod uninstall;
 
@@ -15,6 +16,11 @@ pub use process::{
     find_running_target_processes, is_file_locked, terminate_running_target_processes,
 };
 pub use registry_clean::clean_all_application_registry_residue;
+pub use service::{
+    discover_application_services, find_services_in_install_dir, is_current_process_elevated,
+    query_service_state, restart_services_after_update, run_cli_service_op, service_exists,
+    stop_and_delete_application_services, stop_services_for_update,
+};
 pub use shell::{
     create_demo_app_directory, create_shell_shortcut, expand_install_path, get_clipboard_text,
     get_known_folder_path, pick_folder_dialog, pick_open_file_dialog, pick_save_exe_dialog,
@@ -30,3 +36,5 @@ pub use uninstall::{
 pub(crate) use process::query_restart_manager_locking_processes;
 #[cfg(test)]
 pub(crate) use registry_clean::clean_audio_policy_config;
+#[cfg(test)]
+pub(crate) use service::{image_path_matches_install_dir, scan_services_in_registry_key};

@@ -346,6 +346,8 @@ pub struct PackageConfig {
     #[serde(default)]
     pub installer_icon: Option<String>,
     #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
     pub prerequisites: Vec<PrerequisiteRule>,
 }
 
@@ -367,6 +369,7 @@ impl Default for PackageConfig {
             kill_process_on_update: true,
             compression_level: 6,
             installer_icon: None,
+            services: Vec::new(),
             prerequisites: Vec::new(),
         }
     }
@@ -452,6 +455,8 @@ pub struct UninstallReceipt {
     pub desktop_shortcut: Option<String>,
     pub start_menu_shortcut: Option<String>,
     pub registry_key_created: bool,
+    #[serde(default)]
+    pub services: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

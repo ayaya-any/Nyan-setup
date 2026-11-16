@@ -164,6 +164,7 @@ pub fn run_cli_init_config(args: &[String]) {
         "process_conflict_policy": sample_cfg.process_conflict_policy,
         "compression_level": sample_cfg.compression_level,
         "installer_icon": null,
+        "services": sample_cfg.services,
         "license_text": sample_cfg.license_text,
         "prerequisites": sample_cfg.prerequisites,
     });

@@ -311,6 +311,11 @@ impl InstallerWindowState {
             {
                 candidate_files.push(manifest.config.main_exe.clone());
             }
+            let _ = crate::win32_ops::stop_services_for_update(
+                &target_dir,
+                &candidate_files,
+                &manifest.config.services,
+            );
             let _ = terminate_running_target_processes(&target_dir, &candidate_files);
         }
         self.refresh_disk_space();
@@ -420,6 +425,11 @@ impl InstallerWindowState {
 
                     if reg_unins {
                         let _ = tx.send(InstallProgressEvent::RegisteringUninstaller);
+                        let discovered_services = crate::win32_ops::discover_application_services(
+                            &target_dir,
+                            &installed_files,
+                            &manifest.config.services,
+                        );
                         let receipt = UninstallReceipt {
                             app_id: manifest.config.app_id.clone(),
                             app_name: manifest.config.app_name.clone(),
@@ -430,6 +440,7 @@ impl InstallerWindowState {
                             desktop_shortcut: desk_lnk_saved,
                             start_menu_shortcut: menu_lnk_saved,
                             registry_key_created: true,
+                            services: discovered_services,
                         };
 
                         if let Ok(unins_exe) =
