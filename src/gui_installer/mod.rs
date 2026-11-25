@@ -12,9 +12,9 @@ use crate::package::{
 };
 use crate::win32_ops::{
     create_shell_shortcut, detect_existing_installation, expand_install_path,
-    find_running_target_processes, get_known_folder_path, query_disk_space,
-    register_uninstall_entry, terminate_running_target_processes, write_uninstaller_files,
-    ExistingInstallInfo,
+    find_running_target_processes, get_known_folder_path, is_current_process_elevated,
+    query_disk_space, register_uninstall_entry, terminate_running_target_processes,
+    write_uninstaller_files, ExistingInstallInfo,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -159,7 +159,7 @@ impl InstallerWindowState {
             opt_desktop_shortcut: opt_desk,
             opt_start_menu_shortcut: opt_menu,
             opt_register_uninstaller: opt_unins,
-            opt_launch_now: opt_launch,
+            opt_launch_now: opt_launch && !is_current_process_elevated(),
             opt_kill_running_process: opt_kill,
             existing_install,
             running_processes,

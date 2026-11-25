@@ -12,7 +12,7 @@
 - **前置环境检测与部署**：支持在打包时声明注册表键值检测（`HKLM` / `HKCU` / `HKCR` / `HKU`、32/64 位视图）或系统文件及 PE 版本（`VS_FIXEDFILEINFO`）校验规则；条件不满足时可自动解压并静默执行随包附带的运行库（如 `vc_redist.x64.exe`）、运行自定义命令或弹窗提示。
 - **进程冲突检测与 Windows 系统服务联动**：
   - 集成 Windows Restart Manager (`Rstrtmgr.dll`) 与句柄锁检测，精准定位占用目标目录 `.exe` / `.dll` 的进程与服务，支持打包配置 `auto_kill`（自动结束占用进程）或 `prompt_user`（弹出交互式占用提示窗）；
-  - **Windows 服务全生命周期管理**：自动扫描 `HKLM\SYSTEM\CurrentControlSet\Services` 中 `ImagePath`（及 NSSM `Parameters\Application`）指向安装目录的系统服务，并支持在配置中显式声明 `services`；覆盖更新时自动停止运行中的服务、覆写文件后恢复启动；卸载时自动停止服务并调用 `DeleteService` 彻底注销，非管理员运行时支持按需请求 UAC 提权。
+  - **Windows 服务全生命周期管理**：自动扫描 `HKLM\SYSTEM\CurrentControlSet\Services` 中 `ImagePath`（及 NSSM `Parameters\Application`）指向安装目录的系统服务，并支持在配置中显式声明 `services`；覆盖更新时自动停止运行中的服务、覆写文件后恢复启动（当前账户属于管理员组时，停止与恢复在同一个提权进程内完成，只请求一次 UAC）；卸载时自动停止服务并调用 `DeleteService` 彻底注销，非管理员运行时支持按需请求 UAC 提权。
 - **深度卸载清理**：
   - 自动停止并删除关联系统服务，安全终止安装目录内运行的目标进程；
   - 递归清理文件与空子目录，结合安全目录校验机制自销毁安装根目录；

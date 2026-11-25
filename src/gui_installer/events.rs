@@ -257,7 +257,9 @@ impl InstallerWindowState {
                 let btn_finish = RectF::new(card.x + card.w - 184.0, btn_y, 158.0, 38.0);
 
                 if chk_launch.contains(x, y) {
-                    self.opt_launch_now = !self.opt_launch_now;
+                    if !crate::win32_ops::is_current_process_elevated() {
+                        self.opt_launch_now = !self.opt_launch_now;
+                    }
                 } else if btn_open_folder.contains(x, y) {
                     let dir = PathBuf::from(&self.install_dir_input);
                     shell_open(&dir, None, None);
