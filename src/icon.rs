@@ -472,7 +472,7 @@ pub mod tests {
             let c = ((sz / 2 * sz + sz / 2) * 4 + 3) as usize;
             assert_eq!(img.bgra[c], 255, "centre pixel opaque at {}px", sz);
         }
-        // The built-in squircle sits inside transparent padding, so it must be enlarged.
+        // The built-in die-cut icon sits inside transparent padding, so it must be enlarged.
         let big = decode(128).unwrap();
         assert!(big.art_scale > 1.05 && big.art_scale < 1.3, "{}", big.art_scale);
         assert_eq!(pick_size(28.0), 32);

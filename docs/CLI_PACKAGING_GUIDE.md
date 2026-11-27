@@ -134,7 +134,7 @@ my-project/
 | `publisher` | `string` | 否 | `"Nyan Softworks Inc."` | 发布者/公司名称（写入系统“应用和功能”卸载信息）。 |
 | `main_exe` | `string` | 否 | `"NyanApp.exe"` | 主程序相对于 `source_dir` 的路径（如 `"MyApp.exe"` 或 `"bin\\MyApp.exe"`），用于创建快捷方式、提取应用图标及安装完成后立即启动。 |
 | `default_install_dir` | `string` | 否 | `"%LOCALAPPDATA%\\Programs\\<app_name>"` | 默认安装路径。支持环境变量展开：`%LOCALAPPDATA%`、`%APPDATA%`、`%PROGRAMFILES%`、`%PROGRAMFILES(X86)%`、`%USERPROFILE%`、`%TEMP%`。 |
-| `installer_icon` | `string \| null` | 否 | `null` | 自定义 `.ico` 图标文件路径。设置后将在打包时直接替换安装包 `.exe` 与卸载器 `unins000.exe` 的 PE 原生图标资源（`RT_GROUP_ICON` / `RT_ICON`）。 |
+| `installer_icon` | `string \| null` | 否 | `null` | 自定义 `.ico` 图标文件路径（支持 32bpp DIB / PNG 帧格式）。留空 `null` 时使用内置原创 Q 版二次元赛璐璐多分辨率图标（`resources/app.ico`，16–256px 共 7 帧）；指定后将在打包时直接替换安装包 `.exe` 与卸载器 `unins000.exe` 的 PE 原生图标资源（`RT_GROUP_ICON` / `RT_ICON`），并同步生效于 Direct2D 标题栏与向导品牌卡片。 |
 | `compression_level` | `number` | 否 | `6` | 固实 LZMA2 压缩等级，取值范围 `1` ~ `9`（数值越大压缩率越高、字典越大，推荐 `6` ~ `9`）。 |
 | `create_desktop_shortcut` | `boolean` | 否 | `true` | 安装向导中“在桌面创建快捷方式”选项的默认勾选状态。 |
 | `create_start_menu_shortcut` | `boolean` | 否 | `true` | 安装向导中“在开始菜单创建快捷方式”选项的默认勾选状态。 |

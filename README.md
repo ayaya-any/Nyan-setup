@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="resources/icons/app-256.png" width="112" alt="Nyan Setup Icon" />
+</p>
+
 # Nyan Setup
 
 基于 Rust 与 Win32 Direct2D 的轻量级 Windows 软件安装与打包工具。采用静态链接，无运行时依赖，提供可视化设计器（Studio）与命令行打包工具，生成单文件自解压安装包。
@@ -8,7 +12,7 @@
 - **现代化图形界面**：基于 Direct2D 与 DirectWrite 硬件加速渲染，支持 Fluent 风格设计与暗色主题。
 - **高压缩率归档**：内置 x86 BCJ 指令预处理与固实 Solid LZMA2 字典压缩，有效缩减安装包体积。
 - **单执行文件架构**：安装包采用自解压 Stub + 固实压缩流 + 尾部清单架构，单个可执行文件即可独立运行。
-- **PE 资源动态注入**：支持打包时指定自定义 `.ico` 图标，自动通过 Windows UpdateResource API 重构替换 PE 内部图标资源。
+- **原创图标与 PE 资源动态注入**：内置原创 Q 版二次元赛璐璐透明异形图标（`resources/app.ico`，含 16–256px 共 7 帧及 `resources/icons/app-{16..1024}.png` 全尺寸母版），界面标题栏、向导卡片与可执行文件共用同一 PE 图标资源；支持打包时指定自定义 `.ico` 图标，通过 Windows UpdateResource API 自动重构替换安装包与卸载程序的 PE 图标资源。
 - **前置环境检测与部署**：支持在打包时声明注册表键值检测（`HKLM` / `HKCU` / `HKCR` / `HKU`、32/64 位视图）或系统文件及 PE 版本（`VS_FIXEDFILEINFO`）校验规则；条件不满足时可自动解压并静默执行随包附带的运行库（如 `vc_redist.x64.exe`）、运行自定义命令或弹窗提示。
 - **进程冲突检测与 Windows 系统服务联动**：
   - 集成 Windows Restart Manager (`Rstrtmgr.dll`) 与句柄锁检测，精准定位占用目标目录 `.exe` / `.dll` 的进程与服务，支持打包配置 `auto_kill`（自动结束占用进程）或 `prompt_user`（弹出交互式占用提示窗）；
@@ -118,7 +122,10 @@ cargo run --release -- build-demo
 Nyan-setup/
 ├── .cargo/               # 编译器静态链接配置 (+crt-static)
 ├── docs/                 # 详细打包与命令行配置操作指南
-├── resources/            # 应用程序图标与 PE 资源脚本
+├── resources/            # 原创 Q 版赛璐璐应用图标与 PE 资源脚本
+│   ├── app.ico           # Windows 多分辨率图标（16/24/32/48/64/128 DIB + 256 PNG）
+│   ├── app.rc            # Windows 资源编译脚本
+│   └── icons/            # 全尺寸透明异形 PNG 图标（app-16.png ~ app-1024.png）
 ├── src/
 │   ├── main.rs           # 程序主入口与运行模式路由
 │   ├── cli.rs            # 命令行子命令实现 (init-config, pack, build-demo)
